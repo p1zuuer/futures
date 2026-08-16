@@ -1,0 +1,48 @@
+# docker-compose.yml
+#
+# Production compose file for the async crypto paper-trading bot.
+# Includes resource limits to protect small VPS instances and log
+# rotation to prevent unbounded disk usage from long-running processes.
+
+services:
+  crypto-trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: crypto-trading-bot:latest
+    container_name: crypto-trading-bot
+    restart: unless-stopped
+
+    # Load secrets/config from a local .env file (see .env.example).
+    env_file:
+      - .env
+
+    # Resource limits: keep the bot from starving or crashing a small VPS.
+    # Adjust to match your host's available capacity.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+    # Log rotation: cap container logs at 10MB per file, keep 3 files.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Basic liveness check: verifies the Python process is still running.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python main.py' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Uncomment to persist trade logs / state outside the container:
+    # volumes:
+    #   - ./logs:/app/logs

@@ -1,0 +1,13 @@
+# requirements.txt
+#
+# Pinned dependencies for the async crypto paper-trading bot.
+# Exact-pinned (==) for reproducible builds across environments.
+
+pandas==2.2.3
+numpy==1.26.4
+pydantic==2.9.2
+aiogram==3.15.0
+loguru==0.7.2
+dydx-v4-client==1.1.6
+python-dotenv==1.2.2
+httpx==0.27.2
