@@ -315,6 +315,86 @@ class PaperExchange:
         self._indexer_connected = False
         logger.info("PaperExchange market-data connection closed.")
 
+    # ------------------------------------------------------------------ #
+    # State export/import — restart safety for the simulated account.
+    # PaperExchange has no real backing store (unlike LIVE, where dYdX
+    # itself is the source of truth for positions/balance), so a process
+    # restart would otherwise silently wipe the paper account back to its
+    # starting balance. These let the caller (TradingBot) persist and
+    # restore the full account state across restarts.
+    # ------------------------------------------------------------------ #
+
+    def export_state(self) -> dict:
+        """Serialize the full account state to a JSON-safe dict."""
+        return {
+            "balance_usd": self.account.balance_usd,
+            "equity_usd": self.account.equity_usd,
+            "open_positions": {
+                symbol: pos.to_dict() for symbol, pos in self.account.open_positions.items()
+            },
+            "pending_orders": {
+                order_id: order.to_dict()
+                for order_id, order in self.account.pending_orders.items()
+            },
+            "last_prices": dict(self._last_prices),
+        }
+
+    def import_state(self, state: dict) -> None:
+        """
+        Restore account state previously produced by `export_state()`.
+        Intended to be called once, immediately after construction and
+        before `connect()`/any trading activity — overwrites the fresh
+        `initial_balance` account created in `__init__`.
+        """
+        try:
+            self.account.balance_usd = float(state["balance_usd"])
+            self.account.equity_usd = float(state["equity_usd"])
+
+            self.account.open_positions = {}
+            for symbol, pos_dict in state.get("open_positions", {}).items():
+                self.account.open_positions[symbol] = Position(
+                    symbol=pos_dict["symbol"],
+                    side=PositionSide(pos_dict["side"]),
+                    entry_price=pos_dict["entry_price"],
+                    quantity=pos_dict["quantity"],
+                    leverage=pos_dict.get("leverage", 1.0),
+                    stop_loss=pos_dict.get("stop_loss"),
+                    take_profit=pos_dict.get("take_profit"),
+                    unrealized_pnl=pos_dict.get("unrealized_pnl", 0.0),
+                    realized_pnl=pos_dict.get("realized_pnl", 0.0),
+                    margin=pos_dict.get("margin", 0.0),
+                )
+
+            self.account.pending_orders = {}
+            for order_id, order_dict in state.get("pending_orders", {}).items():
+                self.account.pending_orders[order_id] = Order(
+                    id=order_dict["id"],
+                    symbol=order_dict["symbol"],
+                    side=OrderSide(order_dict["side"]),
+                    order_type=OrderType(order_dict["order_type"]),
+                    quantity=order_dict["quantity"],
+                    price=order_dict.get("price"),
+                    status=OrderStatus(order_dict.get("status", "OPEN")),
+                    timestamp=order_dict.get("timestamp", _now()),
+                    stop_loss=order_dict.get("stop_loss"),
+                    take_profit=order_dict.get("take_profit"),
+                    leverage=order_dict.get("leverage", 1.0),
+                )
+
+            self._last_prices = dict(state.get("last_prices", {}))
+
+            logger.info(
+                "PaperExchange state restored | balance=$%.4f equity=$%.4f "
+                "open_positions=%d pending_orders=%d",
+                self.account.balance_usd, self.account.equity_usd,
+                len(self.account.open_positions), len(self.account.pending_orders),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.error(
+                "Failed to restore PaperExchange state (%s) — continuing with a "
+                "fresh account instead of a corrupted/partial one.", exc,
+            )
+
     def _ensure_market_data_connected(self) -> None:
         if not self._indexer_connected:
             raise MarketDataUnavailableError(

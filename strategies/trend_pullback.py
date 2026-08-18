@@ -87,6 +87,10 @@ class TrendPullbackStrategy:
         atr_period: int = 14,
         atr_multiplier: float = 1.5,
         risk_reward_ratio: float = 2.0,
+        tp_atr_multiplier: Optional[float] = None,
+        adx_period: int = 14,
+        adx_threshold: float = 20.0,
+        use_adx_filter: bool = True,
         cooldown_candles: int = 8,
         min_atr_pct: float = 0.12,
     ) -> None:
@@ -102,6 +106,12 @@ class TrendPullbackStrategy:
             raise ValueError("atr_multiplier must be positive")
         if risk_reward_ratio <= 0:
             raise ValueError("risk_reward_ratio must be positive")
+        if tp_atr_multiplier is not None and tp_atr_multiplier <= 0:
+            raise ValueError("tp_atr_multiplier must be positive when provided")
+        if adx_period <= 0:
+            raise ValueError("adx_period must be positive")
+        if adx_threshold < 0:
+            raise ValueError("adx_threshold must be non-negative")
         if cooldown_candles < 0:
             raise ValueError("cooldown_candles must be non-negative")
         if min_atr_pct < 0:
@@ -116,6 +126,15 @@ class TrendPullbackStrategy:
         self.atr_period = atr_period
         self.atr_multiplier = atr_multiplier
         self.risk_reward_ratio = risk_reward_ratio
+        # If set, TP is computed directly as `entry +/- tp_atr_multiplier * ATR`,
+        # decoupled from the SL-distance/risk_reward_ratio framing — a
+        # separate, directly tunable lever for grid search. If None
+        # (default), TP falls back to the original
+        # SL_distance * risk_reward_ratio behavior for backward compatibility.
+        self.tp_atr_multiplier = tp_atr_multiplier
+        self.adx_period = adx_period
+        self.adx_threshold = adx_threshold
+        self.use_adx_filter = use_adx_filter
         self.cooldown_candles = cooldown_candles
         self.min_atr_pct = min_atr_pct
 
@@ -127,10 +146,11 @@ class TrendPullbackStrategy:
         logger.info(
             "TrendPullbackStrategy initialized | ema_trend=%d ema_pullback=%d "
             "rsi_period=%d rsi_oversold=%.1f rsi_overbought=%.1f use_rsi_confirmation=%s "
-            "atr_mult=%.2f rr=%.2f cooldown_candles=%d min_atr_pct=%.3f%%",
+            "atr_mult=%.2f rr=%.2f tp_atr_multiplier=%s adx_period=%d adx_threshold=%.1f "
+            "use_adx_filter=%s cooldown_candles=%d min_atr_pct=%.3f%%",
             ema_trend, ema_pullback, rsi_period, rsi_oversold, rsi_overbought,
-            use_rsi_confirmation, atr_multiplier, risk_reward_ratio,
-            cooldown_candles, min_atr_pct,
+            use_rsi_confirmation, atr_multiplier, risk_reward_ratio, tp_atr_multiplier,
+            adx_period, adx_threshold, use_adx_filter, cooldown_candles, min_atr_pct,
         )
 
     # ------------------------------------------------------------------ #
@@ -154,6 +174,36 @@ class TrendPullbackStrategy:
             self._last_stop_out.pop(symbol, None)
         else:
             self._last_stop_out[symbol].pop(self._normalize_side(side), None)
+
+    def get_cooldown_state(self) -> dict:
+        """
+        Serialize all active cooldowns to a JSON-safe dict:
+        {symbol: {side: iso_timestamp}}. Used for restart-safety
+        persistence — cooldown state lives only in this in-process dict
+        otherwise, and would be silently wiped by a process restart.
+        """
+        return {
+            symbol: {side: ts.isoformat() for side, ts in sides.items()}
+            for symbol, sides in self._last_stop_out.items()
+        }
+
+    def restore_cooldown_state(self, state: dict) -> None:
+        """Restore cooldowns previously produced by `get_cooldown_state()`."""
+        restored: Dict[str, Dict[str, pd.Timestamp]] = {}
+        try:
+            for symbol, sides in state.items():
+                restored[symbol] = {
+                    side: pd.Timestamp(ts) for side, ts in sides.items()
+                }
+            self._last_stop_out = restored
+            total = sum(len(sides) for sides in restored.values())
+            logger.info("Cooldown state restored | %d active cooldown(s) across %d symbol(s)",
+                        total, len(restored))
+        except (AttributeError, ValueError, TypeError) as exc:
+            logger.error(
+                "Failed to restore cooldown state (%s) — starting with no active "
+                "cooldowns instead of a corrupted/partial one.", exc,
+            )
 
     @staticmethod
     def _normalize_side(side: str) -> str:
@@ -195,9 +245,11 @@ class TrendPullbackStrategy:
             raise InvalidDataFrameError(f"DataFrame is missing required column(s): {missing}")
 
     def _min_required_rows(self) -> int:
-        # EMA(200) needs the most warmup of any indicator here; +5 buffer
-        # for the boundary/comparison candles used in the entry logic.
-        return max(self.ema_trend, self.rsi_period, self.atr_period) + 5
+        # ADX needs roughly 2x its period for a stable (Wilder-double-
+        # smoothed) value; EMA(200) is usually the larger constraint, but
+        # take whichever warmup is longest. +5 buffer for the boundary/
+        # comparison candles used in the entry logic.
+        return max(self.ema_trend, self.rsi_period, self.atr_period, self.adx_period * 2) + 5
 
     # ------------------------------------------------------------------ #
     # Indicator calculation
@@ -213,6 +265,58 @@ class TrendPullbackStrategy:
         range3 = (low - prev_close).abs()
         true_range = pd.concat([range1, range2, range3], axis=1).max(axis=1)
         return true_range.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+    def _adx(self, df: pd.DataFrame, period: int) -> pd.Series:
+        """
+        Standard Wilder ADX (Average Directional Index): measures trend
+        STRENGTH (not direction) on a 0-100 scale. Used here purely as a
+        gate — high ADX means the market is trending strongly enough for
+        a trend-following pullback entry to be meaningful; low ADX means
+        consolidation/chop, where pullback entries tend to whipsaw.
+
+        Standard construction:
+            +DM = max(high[t]-high[t-1], 0) if it exceeds -DM, else 0
+            -DM = max(low[t-1]-low[t], 0) if it exceeds +DM, else 0
+            TR  = true range (same as _atr's true_range, unsmoothed)
+            +DI = 100 * Wilder_smooth(+DM) / Wilder_smooth(TR)
+            -DI = 100 * Wilder_smooth(-DM) / Wilder_smooth(TR)
+            DX  = 100 * |+DI - -DI| / (+DI + -DI)
+            ADX = Wilder_smooth(DX)
+        """
+        import numpy as np
+
+        high, low, close = df["high"], df["low"], df["close"]
+        prev_high, prev_low, prev_close = high.shift(1), low.shift(1), close.shift(1)
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm = pd.Series(
+            np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index
+        )
+        minus_dm = pd.Series(
+            np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index
+        )
+
+        tr = pd.concat(
+            [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+        ).max(axis=1)
+
+        smoothed_tr = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+        smoothed_plus_dm = plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+        smoothed_minus_dm = minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            plus_di = 100.0 * (smoothed_plus_dm / smoothed_tr)
+            minus_di = 100.0 * (smoothed_minus_dm / smoothed_tr)
+            di_sum = plus_di + minus_di
+            dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+
+        dx = dx.where(di_sum != 0, other=0.0)
+        adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+        # Preserve NaN through the full double-warmup period.
+        adx = adx.where(smoothed_tr.notna() & dx.notna(), other=pd.NA).astype("float64")
+        return adx
 
     def _rsi(self, series: pd.Series, period: int) -> pd.Series:
         """Standard Wilder's RSI: RS = avg_gain / avg_loss (Wilder-smoothed
@@ -240,8 +344,8 @@ class TrendPullbackStrategy:
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute `ema_trend`, `ema_pullback`, `rsi`, and `atr` columns on a
-        copy of `df`. Expects columns:
+        Compute `ema_trend`, `ema_pullback`, `rsi`, `atr`, and `adx` columns
+        on a copy of `df`. Expects columns:
         ['timestamp', 'open', 'high', 'low', 'close', 'volume'].
         """
         self._validate_columns(df)
@@ -250,6 +354,7 @@ class TrendPullbackStrategy:
         out["ema_pullback"] = self._ema(out["close"], self.ema_pullback)
         out["rsi"] = self._rsi(out["close"], self.rsi_period)
         out["atr"] = self._atr(out, self.atr_period)
+        out["adx"] = self._adx(out, self.adx_period)
         return out
 
     # ------------------------------------------------------------------ #
@@ -273,7 +378,7 @@ class TrendPullbackStrategy:
             raise InsufficientDataError(
                 f"need at least {min_rows} rows to analyze "
                 f"(max(ema_trend={self.ema_trend}, rsi_period={self.rsi_period}, "
-                f"atr_period={self.atr_period}) + 5), got {len(df)}"
+                f"atr_period={self.atr_period}, adx_period*2={self.adx_period * 2}) + 5), got {len(df)}"
             )
 
         indicators = self.calculate_indicators(df)
@@ -281,7 +386,7 @@ class TrendPullbackStrategy:
         last_closed = indicators.iloc[-2]
         prev_closed = indicators.iloc[-3]
 
-        required_fields = ["ema_trend", "ema_pullback", "rsi", "atr"]
+        required_fields = ["ema_trend", "ema_pullback", "rsi", "atr", "adx"]
         if last_closed[required_fields].isna().any() or prev_closed[required_fields].isna().any():
             raise InsufficientDataError(
                 "indicators contain NaN values on the evaluated candles — "
@@ -294,6 +399,7 @@ class TrendPullbackStrategy:
         ema_pullback_prev = float(prev_closed["ema_pullback"])
         close_prev = float(prev_closed["close"])
         rsi_prev = float(prev_closed["rsi"])
+        adx_now = float(last_closed["adx"])
 
         macro_uptrend = close_now > ema_trend_now
         macro_downtrend = close_now < ema_trend_now
@@ -338,6 +444,22 @@ class TrendPullbackStrategy:
         side: SignalSide = raw_side
         reason: Optional[str] = None
 
+        # ADX gate: only allow entries while the market is trending
+        # strongly enough (ADX above threshold) for a trend-following
+        # pullback to be meaningful. Applied BEFORE the volatility filter
+        # since it's a distinct concept (trend strength vs. raw price
+        # movement magnitude) — a market can have high ATR% while still
+        # chopping directionlessly (low ADX), or low ATR% within a
+        # genuine slow grind (higher ADX).
+        if side != "HOLD" and self.use_adx_filter and adx_now < self.adx_threshold:
+            logger.info(
+                "SIGNAL FILTERED (weak trend / ADX) | %s %s candidate suppressed: "
+                "adx=%.2f < adx_threshold=%.2f",
+                symbol, side, adx_now, self.adx_threshold,
+            )
+            reason = "weak_trend_adx"
+            side = "HOLD"
+
         if side != "HOLD" and atr_pct < self.min_atr_pct:
             logger.info(
                 "SIGNAL FILTERED (low volatility) | %s %s candidate suppressed: "
@@ -359,7 +481,14 @@ class TrendPullbackStrategy:
             side = "HOLD"
 
         sl_distance = atr_value * self.atr_multiplier
-        tp_distance = sl_distance * self.risk_reward_ratio
+        # ATR-based TP: if tp_atr_multiplier is set, TP is a direct,
+        # independently tunable N*ATR distance from entry rather than
+        # being derived from the SL distance via risk_reward_ratio.
+        tp_distance = (
+            atr_value * self.tp_atr_multiplier
+            if self.tp_atr_multiplier is not None
+            else sl_distance * self.risk_reward_ratio
+        )
 
         if side == "BUY":
             stop_loss = entry_price - sl_distance
@@ -383,10 +512,10 @@ class TrendPullbackStrategy:
         )
 
         logger.info(
-            "SIGNAL GENERATED | %s %s entry=%.4f SL=%.4f TP=%.4f ATR=%.4f "
+            "SIGNAL GENERATED | %s %s entry=%.4f SL=%.4f TP=%.4f ATR=%.4f ADX=%.2f "
             "(atr_pct=%.4f%% ema_trend=%.4f ema_pullback=%.4f rsi_prev=%.2f "
             "macro=%s raw_side=%s reason=%s)",
-            symbol, side, entry_price, stop_loss, take_profit, atr_value, atr_pct,
+            symbol, side, entry_price, stop_loss, take_profit, atr_value, adx_now, atr_pct,
             ema_trend_now, ema_pullback_now, rsi_prev,
             "UP" if macro_uptrend else ("DOWN" if macro_downtrend else "FLAT"),
             raw_side, reason,

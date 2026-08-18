@@ -1,18 +1,23 @@
 """
 main.py
 
-Autonomous async paper-trading bot orchestrator. Wires together:
+Autonomous async multi-ticker paper/live trading bot orchestrator. Wires
+together:
 
     - exchange.paper_exchange.PaperExchange    (simulated dYdX v4 execution)
     - exchange.dydx_v4_adapter.DydxV4Adapter   (live dYdX v4 execution)
     - strategies.trend_ema.TrendEmaStrategy    (EMA crossover + ATR SL/TP)
+    - strategies.trend_pullback.TrendPullbackStrategy (EMA200 trend filter
+      + EMA20/RSI pullback + ADX + ATR-based TP)
     - risk.manager.RiskManager                 (equity-based position sizing)
     - services.telegram_notifier.TelegramNotifier (real-time Telegram alerts)
+    - state.persistence.BotStateStore          (restart-safety persistence)
 
-against a synthetic live market data feed, running a continuous async
-event loop that ticks the exchange, evaluates the strategy when flat,
-sizes/places orders through the risk manager, and pushes Telegram alerts
-for signals, fills, and position closes.
+against the live dYdX v4 Indexer, running a continuous async event loop
+that, each tick, evaluates every configured ticker SEQUENTIALLY (not
+concurrently) using a single shared exchange adapter instance — this
+keeps API usage predictable and respects Indexer rate limits regardless
+of how many symbols are configured.
 
 Run:
     python3 main.py
@@ -26,6 +31,18 @@ Exchange backend is selected via DYDX_V4_LIVE_TRADING_ENABLED: unset/false
 to DydxV4Adapter for live dYdX v4 execution (which carries its own
 independent kill-switch check inside every order-placing call).
 
+Tickers are configured via TICKERS (comma-separated, e.g.
+"BTC-USD,ETH-USD,SOL-USD"), defaulting to a single symbol for backward
+compatibility with existing single-asset deployments.
+
+State persistence (STATE_PERSISTENCE_ENABLED, default on): cooldown
+timestamps, daily risk-tracking, open conditional-order IDs, and (PAPER
+mode only) the full simulated account are persisted to a local JSON file
+(STATE_FILE_PATH, default "bot_state.json") after every tick round and on
+shutdown, and restored on boot — so a Render container restart doesn't
+silently reset cooldowns, forget the day's accumulated PnL past the daily
+loss circuit breaker, or wipe the paper account.
+
 Author: Senior Python Async Developer
 """
 
@@ -35,10 +52,8 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Union
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Dict, List, Optional, Tuple, Union
+
 import pandas as pd
 
 # Import config FIRST: this triggers .env loading (via python-dotenv) and
@@ -58,6 +73,7 @@ from exchange.paper_exchange import (
 )
 from risk.manager import PositionPlan, RiskManager
 from services.telegram_notifier import TelegramNotifier
+from state.persistence import BotStateStore
 from strategies.trend_ema import Signal, TrendEmaStrategy
 from strategies.trend_pullback import TrendPullbackStrategy
 
@@ -76,19 +92,7 @@ if not logger.handlers:
 # --------------------------------------------------------------------------- #
 # Synthetic market data feed
 # --------------------------------------------------------------------------- #
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Trading Bot is alive!")
 
-def start_health_check_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-# Запускаем фейковый веб-сервер в фоновом потоке
-threading.Thread(target=start_health_check_server, daemon=True).start()
 class MarketDataFeed:
     """
     Simulates a live price tick stream and maintains a rolling OHLCV
@@ -232,8 +236,17 @@ class TradingBot:
     Telegram alerts for signals, fills, and position closes.
     """
 
-    def __init__(self, symbol: str = "ETH-USD", initial_balance: float = 15.0) -> None:
-        self.symbol = symbol
+    def __init__(
+        self,
+        symbols: Optional[List[str]] = None,
+        initial_balance: float = 15.0,
+        inter_symbol_delay_seconds: float = 0.25,
+    ) -> None:
+        # Ticker list: explicit param wins, otherwise config.settings.tickers
+        # (parsed from TICKERS env var, e.g. "BTC-USD,ETH-USD,SOL-USD").
+        # Sequential (not concurrent) processing per tick — see _tick_once.
+        self.symbols: Tuple[str, ...] = tuple(symbols) if symbols else settings.tickers
+        self.inter_symbol_delay_seconds = inter_symbol_delay_seconds
 
         # Exchange backend selection: live dYdX v4 execution vs local paper
         # simulation, controlled by DYDX_V4_LIVE_TRADING_ENABLED. Sourced
@@ -254,6 +267,12 @@ class TradingBot:
         # now 5-minute candles, configurable via CANDLE_RESOLUTION.
         self.candle_resolution: str = settings.candle_resolution
 
+        # A SINGLE shared exchange adapter instance is used across every
+        # symbol — this is what makes sequential per-symbol processing
+        # actually respect account-wide rate limits (one Indexer
+        # connection, one Node/gRPC connection for LIVE, one subaccount
+        # whose cross-margined balance/positions naturally cover all
+        # symbols in a single get_account_summary() call).
         self.exchange: BaseExchange
         if self.live_trading_enabled:
             self.exchange = DydxV4Adapter()
@@ -263,8 +282,8 @@ class TradingBot:
             logger.info("TradingBot initialized in PAPER simulation mode")
 
         self.risk_manager = RiskManager(
-            risk_per_trade_pct=1.0,
-            max_position_leverage=2.0,
+            risk_per_trade_pct=settings.risk_per_trade_pct,
+            max_position_leverage=settings.risk_max_position_leverage,
             max_daily_loss_pct=settings.risk_max_daily_loss_pct,
         )
 
@@ -273,6 +292,12 @@ class TradingBot:
         # — backtesting showed EMA(9/21) crossovers on 1m/5m generate too
         # much noise/fee drag for positive expectancy. "trend_ema" is kept
         # available as the legacy option via STRATEGY_TYPE=trend_ema.
+        # A SINGLE strategy instance is shared across all symbols — its
+        # cooldown state is already keyed per-symbol internally
+        # (`Dict[symbol][side]`), so this is safe: no state bleed between
+        # tickers, and the daily-loss circuit breaker in RiskManager is
+        # intentionally portfolio-wide (shared across all symbols), not
+        # per-symbol, since it's a single account's daily drawdown limit.
         if settings.strategy_type == "trend_pullback":
             self.strategy = TrendPullbackStrategy(
                 ema_trend=settings.strategy_ema_trend,
@@ -281,6 +306,10 @@ class TradingBot:
                 rsi_oversold=settings.strategy_rsi_oversold,
                 rsi_overbought=settings.strategy_rsi_overbought,
                 use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
+                tp_atr_multiplier=settings.strategy_tp_atr_multiplier,
+                adx_period=settings.strategy_adx_period,
+                adx_threshold=settings.strategy_adx_threshold,
+                use_adx_filter=settings.strategy_use_adx_filter,
                 cooldown_candles=settings.strategy_cooldown_candles,
                 min_atr_pct=settings.strategy_min_atr_pct,
             )
@@ -300,14 +329,27 @@ class TradingBot:
         # and is not used by TradingBot.
         self.notifier = TelegramNotifier.from_env()
 
+        # Restart-safety persistence (see state/persistence.py). Disabled
+        # entirely via STATE_PERSISTENCE_ENABLED=false if not wanted.
+        self.state_store: Optional[BotStateStore] = (
+            BotStateStore(settings.state_file_path) if settings.state_persistence_enabled else None
+        )
+
         self._running = False
         self._tick_number = 0
+        # symbol -> {"stop_loss_order_id", "take_profit_order_id"} for the
+        # currently-open position's conditional orders (LIVE mode only —
+        # used to cancel the sibling leg once a position closes, since
+        # dYdX v4 does not auto-cancel it; see _cancel_stale_conditional_orders.
+        self._open_conditional_orders: Dict[str, dict] = {}
 
         logger.info(
-            "TradingBot initialized | symbol=%s initial_balance=$%.2f telegram=%s "
-            "exchange=%s candle_resolution=%s",
-            symbol, initial_balance, "ENABLED" if self.notifier.enabled else "DISABLED",
+            "TradingBot initialized | symbols=%s initial_balance=$%.2f telegram=%s "
+            "exchange=%s candle_resolution=%s state_persistence=%s",
+            list(self.symbols), initial_balance,
+            "ENABLED" if self.notifier.enabled else "DISABLED",
             type(self.exchange).__name__, self.candle_resolution,
+            "ENABLED" if self.state_store else "DISABLED",
         )
 
     # ------------------------------------------------------------------ #
@@ -320,6 +362,46 @@ class TradingBot:
             await self.notifier.send_signal_alert(signal.to_dict())
         except Exception as exc:  # noqa: BLE001 - never let alerts break trading
             logger.warning("Failed to send signal alert: %s", exc)
+
+    async def _cancel_stale_conditional_orders(self, symbol: str, triggered_reason: str) -> None:
+        """
+        Cancel whichever conditional order (SL or TP) did NOT trigger,
+        after the other one closed the position. dYdX v4 does not link
+        these as an OCO pair — they're two independent orders submitted
+        separately by `place_order()` — so the one that didn't fire keeps
+        resting on the book indefinitely unless explicitly cancelled here.
+        Left alone, it can later trigger against a completely unrelated
+        future position at a stale price. No-op for PaperExchange (which
+        has no conditional-order concept; nothing gets recorded into
+        `_open_conditional_orders` for it in the first place).
+        """
+        ids = self._open_conditional_orders.pop(symbol, None)
+        if not ids:
+            return
+
+        stale_id = ids["take_profit_order_id"] if triggered_reason == "STOP_LOSS" else ids["stop_loss_order_id"]
+        if not stale_id:
+            return
+
+        cancel_method = getattr(self.exchange, "cancel_order", None)
+        if not callable(cancel_method):
+            return
+
+        try:
+            await cancel_method(stale_id)
+            logger.info(
+                "🧹 Cancelled stale %s conditional order %s for %s (position closed via %s)",
+                "TAKE_PROFIT" if triggered_reason == "STOP_LOSS" else "STOP_LOSS",
+                stale_id, symbol, triggered_reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - the order may have already
+            # been filled/cancelled/expired on-chain; that's fine, the goal
+            # (no stale order left resting) is already satisfied either way.
+            logger.warning(
+                "Could not cancel stale conditional order %s for %s (may already be "
+                "gone, which is fine): %s",
+                stale_id, symbol, exc,
+            )
 
     async def _notify_order_executed(
         self,
@@ -369,12 +451,12 @@ class TradingBot:
     # Strategy evaluation + order placement
     # ------------------------------------------------------------------ #
 
-    async def _maybe_open_position(self, df: pd.DataFrame) -> None:
+    async def _maybe_open_position(self, symbol: str, df: pd.DataFrame) -> None:
         """Run the strategy when flat and place a sized order on BUY/SELL."""
         try:
-            signal: Signal = self.strategy.analyze(self.symbol, df)
+            signal: Signal = self.strategy.analyze(symbol, df)
         except Exception as exc:  # InsufficientDataError / InvalidDataFrameError
-            logger.debug("Strategy analysis skipped: %s", exc)
+            logger.debug("Strategy analysis skipped for %s: %s", symbol, exc)
             return
 
         if signal.side == "HOLD":
@@ -387,7 +469,7 @@ class TradingBot:
         free_margin = summary["free_margin_usd"]
 
         plan: PositionPlan = self.risk_manager.calculate_position(
-            symbol=self.symbol,
+            symbol=symbol,
             side=signal.side,
             equity_usd=equity,
             free_margin_usd=free_margin,
@@ -399,7 +481,7 @@ class TradingBot:
         if not plan.valid:
             logger.warning(
                 "SIGNAL SKIPPED | %s %s reason=%s",
-                self.symbol, signal.side, plan.rejection_reason,
+                symbol, signal.side, plan.rejection_reason,
             )
             return
 
@@ -407,8 +489,8 @@ class TradingBot:
         balance_before = summary["balance_usd"]
 
         try:
-            await self.exchange.place_order(
-                symbol=self.symbol,
+            order_result = await self.exchange.place_order(
+                symbol=symbol,
                 side=order_side,
                 order_type="MARKET",
                 quantity=plan.quantity,
@@ -424,16 +506,30 @@ class TradingBot:
             logger.warning("ORDER REJECTED (invalid order) | %s", exc)
             return
 
+        # Track the SL/TP conditional order IDs (LIVE mode only —
+        # PaperExchange doesn't return them, order_result defaults handle
+        # that). Critical for cleanup: dYdX v4 does NOT auto-cancel the
+        # sibling leg when one of SL/TP fires — a stale conditional order
+        # left resting after a TP/SL close will silently attach to and
+        # fire against whatever position is open later, at a stale
+        # trigger price unrelated to that later trade. See
+        # `_cancel_stale_conditional_orders` for the cleanup half of this.
+        if isinstance(order_result, dict):
+            self._open_conditional_orders[symbol] = {
+                "stop_loss_order_id": order_result.get("stop_loss_order_id"),
+                "take_profit_order_id": order_result.get("take_profit_order_id"),
+            }
+
         # Order placed successfully (MARKET orders fill synchronously inside
         # place_order). Pull the resulting position + fee delta to report
         # the actual executed price rather than the requested entry price.
         post_summary = await self.exchange.get_account_summary()
-        position = post_summary["open_positions"].get(self.symbol)
+        position = post_summary["open_positions"].get(symbol)
         if position is not None:
             fee_paid = max(balance_before - post_summary["balance_usd"], 0.0)
             await self._notify_order_executed(
-                order_id=f"{self.symbol}-{self._tick_number}",
-                symbol=self.symbol,
+                order_id=f"{symbol}-{self._tick_number}",
+                symbol=symbol,
                 executed_price=position["entry_price"],
                 quantity=position["quantity"],
                 fee=fee_paid,
@@ -443,18 +539,27 @@ class TradingBot:
     # Status pulse
     # ------------------------------------------------------------------ #
 
-    async def _status_pulse(self, current_price: float) -> None:
+    async def _status_pulse(self, tick_prices: Dict[str, float]) -> None:
+        """Log one combined pulse line per tick round covering every
+        configured symbol, using a single account-wide summary call
+        (dYdX v4's cross-margined subaccount naturally returns every
+        open position across every symbol in one response)."""
         summary = await self.exchange.get_account_summary()
         positions = summary["open_positions"]
         pending = summary["pending_orders"]
 
-        position_desc = "flat"
-        if self.symbol in positions:
-            pos = positions[self.symbol]
-            position_desc = (
-                f"{pos['side']} qty={pos['quantity']:.6f} "
-                f"entry={pos['entry_price']:.2f} uPnL=${pos['unrealized_pnl']:.4f}"
-            )
+        per_symbol_desc = []
+        for symbol in self.symbols:
+            price = tick_prices.get(symbol)
+            price_str = f"${price:.2f}" if price is not None else "N/A"
+            if symbol in positions:
+                pos = positions[symbol]
+                per_symbol_desc.append(
+                    f"{symbol}={price_str}[{pos['side']} qty={pos['quantity']:.6f} "
+                    f"uPnL=${pos['unrealized_pnl']:.4f}]"
+                )
+            else:
+                per_symbol_desc.append(f"{symbol}={price_str}[flat]")
 
         daily_stats = self.risk_manager.get_daily_stats()
         risk_desc = (
@@ -465,17 +570,16 @@ class TradingBot:
             risk_desc += " 🛑BLOCKED"
 
         logger.info(
-            "PULSE | price=$%.2f | balance=$%.4f | equity=$%.4f | "
-            "position=[%s] | pending_orders=%d | %s",
-            current_price, summary["balance_usd"], summary["equity_usd"],
-            position_desc, len(pending), risk_desc,
+            "PULSE | balance=$%.4f | equity=$%.4f | %s | pending_orders=%d | %s",
+            summary["balance_usd"], summary["equity_usd"],
+            " ".join(per_symbol_desc), len(pending), risk_desc,
         )
 
     # ------------------------------------------------------------------ #
     # Main tick
     # ------------------------------------------------------------------ #
 
-    async def _fetch_market_data(self) -> Optional[tuple[float, pd.DataFrame]]:
+    async def _fetch_market_data(self, symbol: str) -> Optional[tuple[float, pd.DataFrame]]:
         """
         Fetch real-time market data for the current tick. Used identically
         in both PAPER and LIVE mode — `PaperExchange` and `DydxV4Adapter`
@@ -491,51 +595,59 @@ class TradingBot:
         try:
             # fetch_ticker_price gives the freshest tick-level price (oracle
             # price, updates continuously); fetch_candles gives the
-            # strategy its OHLCV window. Both hit the real Indexer.
+            # strategy its OHLCV window. Both hit the real Indexer. These
+            # two calls run concurrently WITHIN a symbol (harmless, same
+            # symbol, same purpose) — it's ACROSS symbols that stays
+            # strictly sequential (see _tick_once).
             current_price, df = await asyncio.gather(
-                self.exchange.fetch_ticker_price(self.symbol),
-                self.exchange.fetch_candles(symbol=self.symbol, resolution=self.candle_resolution, limit=40),
+                self.exchange.fetch_ticker_price(symbol),
+                self.exchange.fetch_candles(symbol=symbol, resolution=self.candle_resolution, limit=40),
             )
         except Exception as exc:  # noqa: BLE001 - transient network/API issue
             logger.warning(
                 "Failed to fetch real-time market data for %s — skipping this tick: %s",
-                self.symbol, exc,
+                symbol, exc,
             )
             return None
 
         if df is None or df.empty:
             logger.warning(
                 "fetch_candles returned no data for %s — skipping this tick.",
-                self.symbol,
+                symbol,
             )
             return None
 
         return float(current_price), df
 
-    async def _tick_once(self) -> None:
-        # Step 1: fetch latest real-time price + OHLCV from the live dYdX
-        # v4 Indexer — identical data source in both PAPER and LIVE mode.
-        market_data = await self._fetch_market_data()
+    async def _process_symbol_tick(self, symbol: str) -> Optional[float]:
+        """
+        Run one full tick's worth of processing for a single symbol:
+        fetch data, feed the exchange, detect closes (+ risk-control
+        bookkeeping + stale conditional-order cleanup), and evaluate for a
+        new entry if flat. Returns the current price for the pulse log, or
+        None if the market-data fetch failed (that symbol is simply
+        skipped for this tick — it does not affect other symbols).
+        """
+        market_data = await self._fetch_market_data(symbol)
         if market_data is None:
-            return  # skip this tick cleanly; loop keeps running
+            return None
         current_price, df = market_data
 
         # Snapshot position + balance state before the tick so we can
         # detect an SL/TP-triggered close performed internally by
         # on_market_tick and report accurate exit/PnL details.
         pre_summary = await self.exchange.get_account_summary()
-        pre_position = pre_summary["open_positions"].get(self.symbol)
+        pre_position = pre_summary["open_positions"].get(symbol)
         balance_before = pre_summary["balance_usd"]
 
-        # Step 2: feed the exchange the new price (limit fills + SL/TP checks
-        # in PAPER mode, matched against real-time prices; a harmless no-op
+        # Feed the exchange the new price (limit fills + SL/TP checks in
+        # PAPER mode, matched against real-time prices; a harmless no-op
         # in LIVE mode, where fills/SL/TP are executed on-chain by dYdX
         # itself rather than simulated here).
-        await self.exchange.on_market_tick(self.symbol, current_price)
+        await self.exchange.on_market_tick(symbol, current_price)
 
-        # Step 3: check current positions after the tick
         post_summary = await self.exchange.get_account_summary()
-        has_open_position = self.symbol in post_summary["open_positions"]
+        has_open_position = symbol in post_summary["open_positions"]
 
         # Detect a position that existed before the tick but is gone now —
         # on_market_tick only closes positions via SL/TP triggers, so this
@@ -555,11 +667,17 @@ class TradingBot:
             # cooldown so this direction isn't immediately re-entered, and
             # update the daily circuit breaker with the realized PnL.
             if reason == "STOP_LOSS":
-                self.strategy.record_stop_out(self.symbol, side, pd.Timestamp.now(tz="UTC"))
+                self.strategy.record_stop_out(symbol, side, pd.Timestamp.now(tz="UTC"))
             self.risk_manager.record_realized_pnl(realized_pnl_usd, post_summary["balance_usd"])
 
+            # LIVE-mode safety: the OTHER conditional order (whichever of
+            # SL/TP did NOT fire) is still resting on dYdX and will NOT be
+            # auto-cancelled by the exchange. Left alone, it can later
+            # attach to and fire against an unrelated future position.
+            await self._cancel_stale_conditional_orders(symbol, triggered_reason=reason)
+
             await self._notify_position_closed(
-                symbol=self.symbol,
+                symbol=symbol,
                 exit_price=current_price,
                 entry_price=entry_price,
                 realized_pnl_usd=realized_pnl_usd,
@@ -567,12 +685,117 @@ class TradingBot:
                 new_balance=post_summary["balance_usd"],
             )
 
-        # Step 4 & 5: evaluate strategy + place sized order only when flat
+        # Evaluate strategy + place sized order only when flat.
         if not has_open_position:
-            await self._maybe_open_position(df)
+            await self._maybe_open_position(symbol, df)
 
-        # Step 6: status pulse
-        await self._status_pulse(current_price)
+        return current_price
+
+    async def _tick_once(self) -> None:
+        """
+        One full tick round: every configured symbol is processed
+        SEQUENTIALLY (never with asyncio.gather across symbols) — this is
+        the deliberate design choice that keeps API usage against the
+        Indexer predictable and rate-limit-safe regardless of how many
+        tickers are configured, at the cost of the tick round taking
+        roughly (per-symbol latency x number of symbols) instead of
+        max(per-symbol latency). A small pacing delay between symbols adds
+        further headroom. Ends with a single combined pulse log covering
+        every symbol from one account-wide summary call.
+        """
+        tick_prices: Dict[str, float] = {}
+
+        for idx, symbol in enumerate(self.symbols):
+            try:
+                price = await self._process_symbol_tick(symbol)
+                if price is not None:
+                    tick_prices[symbol] = price
+            except InsufficientFundsError as exc:
+                logger.warning("Insufficient funds during %s tick: %s", symbol, exc)
+            except InvalidOrderError as exc:
+                logger.warning("Invalid order during %s tick: %s", symbol, exc)
+            except Exception as exc:  # noqa: BLE001 - one bad symbol must not stop the others
+                logger.exception("Unexpected error processing %s: %s", symbol, exc)
+
+            if idx < len(self.symbols) - 1:
+                await asyncio.sleep(self.inter_symbol_delay_seconds)
+
+        await self._status_pulse(tick_prices)
+
+        if self.state_store is not None:
+            await self._save_state()
+
+    # ------------------------------------------------------------------ #
+    # Event loop
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # State persistence (restart safety)
+    # ------------------------------------------------------------------ #
+
+    def _build_state_dict(self) -> dict:
+        """
+        Assemble the full persisted-state dict: cooldowns, daily risk
+        tracking, open conditional-order IDs, and (PAPER mode only) the
+        full simulated account. LIVE mode's positions/balance are NOT
+        persisted here — dYdX itself is already the source of truth for
+        those, and re-deriving them locally on restart would risk
+        drifting out of sync with reality.
+        """
+        state = {
+            "symbols": list(self.symbols),
+            "cooldowns": self.strategy.get_cooldown_state(),
+            "daily_risk": self.risk_manager.get_state(),
+            "open_conditional_orders": dict(self._open_conditional_orders),
+        }
+        if isinstance(self.exchange, PaperExchange):
+            state["paper_account"] = self.exchange.export_state()
+        return state
+
+    async def _save_state(self) -> None:
+        if self.state_store is None:
+            return
+        try:
+            self.state_store.save(self._build_state_dict())
+        except Exception as exc:  # noqa: BLE001 - persistence must never crash the loop
+            logger.warning("Failed to persist bot state (continuing without it): %s", exc)
+
+    def _load_and_apply_state(self) -> None:
+        """
+        Load persisted state (if any) and apply it to the strategy,
+        risk manager, and (PAPER mode) exchange BEFORE the trading loop
+        starts. Called once from `run()`, after construction but before
+        the first tick. A missing/corrupted/schema-mismatched state file
+        is handled entirely inside `BotStateStore.load()` — this method
+        never needs to worry about that case beyond checking for None.
+        """
+        if self.state_store is None:
+            return
+
+        state = self.state_store.load()
+        if state is None:
+            return
+
+        saved_symbols = state.get("symbols")
+        if saved_symbols and set(saved_symbols) != set(self.symbols):
+            logger.warning(
+                "Persisted state was saved for symbols=%s but this run is "
+                "configured for symbols=%s — restoring only the overlapping "
+                "cooldown entries; daily risk state is portfolio-wide and "
+                "restores regardless.",
+                saved_symbols, list(self.symbols),
+            )
+
+        if "cooldowns" in state:
+            self.strategy.restore_cooldown_state(state["cooldowns"])
+
+        if "daily_risk" in state:
+            self.risk_manager.restore_state(state["daily_risk"])
+
+        self._open_conditional_orders = dict(state.get("open_conditional_orders", {}))
+
+        if isinstance(self.exchange, PaperExchange) and "paper_account" in state:
+            self.exchange.import_state(state["paper_account"])
 
     # ------------------------------------------------------------------ #
     # Event loop
@@ -596,14 +819,21 @@ class TradingBot:
             )
             await connect_method()
 
+        # Restore persisted state (cooldowns, daily risk, paper account)
+        # AFTER connect() (so PaperExchange's import_state overwrites the
+        # fresh account connect() would otherwise leave untouched — connect()
+        # only sets up market-data access, it doesn't touch account state)
+        # but BEFORE the first tick.
+        self._load_and_apply_state()
+
         # Start the Telegram polling task (no-op if disabled) and wire the
         # /status command up to live account data before entering the loop.
         await self.notifier.start()
         self.notifier.set_status_callback(self.exchange.get_account_summary)
 
         logger.info(
-            "TradingBot starting | symbol=%s poll_interval=%.1fs",
-            self.symbol, poll_interval_seconds,
+            "TradingBot starting | symbols=%s poll_interval=%.1fs",
+            list(self.symbols), poll_interval_seconds,
         )
 
         try:
@@ -626,9 +856,12 @@ class TradingBot:
             self._running = False
 
     async def shutdown(self) -> None:
-        """Gracefully stop the loop, close the Telegram session and exchange
-        connection, and print final trade metrics."""
+        """Gracefully stop the loop, persist final state, close the
+        Telegram session and exchange connection, and print final trade
+        metrics."""
         self._running = False
+
+        await self._save_state()
 
         try:
             await self.notifier.stop()
@@ -650,7 +883,7 @@ class TradingBot:
         print("\n" + "=" * 60)
         print("TRADING BOT SHUTDOWN — FINAL ACCOUNT SUMMARY")
         print("=" * 60)
-        print(f"Symbol:            {self.symbol}")
+        print(f"Symbols:           {list(self.symbols)}")
         print(f"Exchange:          {type(self.exchange).__name__}")
         print(f"Ticks processed:   {self._tick_number}")
         print(f"Final Balance:     ${summary['balance_usd']:.4f}")
@@ -665,6 +898,8 @@ class TradingBot:
                 f"entry={pos['entry_price']:.2f} uPnL=${pos['unrealized_pnl']:.4f}"
             )
         print(f"Pending Orders:    {list(summary['pending_orders'].keys()) or 'none'}")
+        if self.state_store is not None:
+            print(f"State persisted to: {self.state_store.file_path}")
         print("=" * 60 + "\n")
 
 
@@ -675,7 +910,7 @@ class TradingBot:
 async def _main() -> None:
     import signal
 
-    bot = TradingBot(symbol="ETH-USD", initial_balance=15.0)
+    bot = TradingBot(initial_balance=15.0)
     run_task = asyncio.ensure_future(bot.run(poll_interval_seconds=2.0))
 
     loop = asyncio.get_running_loop()

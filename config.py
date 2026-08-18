@@ -20,7 +20,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("config")
 if not logger.handlers:
@@ -181,6 +181,31 @@ def normalize_candle_resolution(raw: str) -> str:
     return canonical
 
 
+def _parse_tickers(raw: str) -> Tuple[str, ...]:
+    """
+    Parse a comma-separated ticker list (e.g. "BTC-USD, eth-usd,SOL-USD")
+    into a clean, uppercased, deduplicated, order-preserving tuple.
+    Raises ConfigError if the result is empty — the bot needs at least
+    one symbol to trade.
+    """
+    seen = set()
+    tickers = []
+    for raw_symbol in raw.split(","):
+        symbol = raw_symbol.strip().upper()
+        if not symbol:
+            continue
+        if symbol not in seen:
+            seen.add(symbol)
+            tickers.append(symbol)
+
+    if not tickers:
+        raise ConfigError(
+            f"TICKERS={raw!r} did not produce any valid symbols. Expected a "
+            f"comma-separated list like 'BTC-USD,ETH-USD,SOL-USD'."
+        )
+    return tuple(tickers)
+
+
 # --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
@@ -221,7 +246,13 @@ class Settings:
     strategy_rsi_oversold: float        # trend_pullback only
     strategy_rsi_overbought: float      # trend_pullback only
     strategy_use_rsi_confirmation: bool # trend_pullback only
+    strategy_adx_period: int            # trend_pullback only
+    strategy_adx_threshold: float       # trend_pullback only
+    strategy_use_adx_filter: bool       # trend_pullback only
+    strategy_tp_atr_multiplier: Optional[float]  # trend_pullback only; None = use risk_reward_ratio
     risk_max_daily_loss_pct: float
+    risk_max_position_leverage: float
+    risk_per_trade_pct: float
 
     # --- Market data -------------------------------------------------------
     # Candle resolution used for both live trading and calibration. Must be
@@ -230,6 +261,17 @@ class Settings:
     # crossovers generate too much noise/fee drag for positive expectancy,
     # so the default is now 5-minute candles.
     candle_resolution: str
+
+    # --- Tickers -----------------------------------------------------------
+    # Symbols the bot trades, evaluated sequentially each tick (not
+    # concurrently) using a single shared exchange adapter instance, to
+    # keep API usage predictable and respect rate limits regardless of
+    # how many symbols are configured.
+    tickers: Tuple[str, ...]
+
+    # --- State persistence (restart safety) ---------------------------------
+    state_file_path: str
+    state_persistence_enabled: bool
 
     # --- Misc ------------------------------------------------------------
     log_level: str
@@ -297,14 +339,42 @@ class Settings:
             strategy_rsi_oversold=_get_float("STRATEGY_RSI_OVERSOLD", 40.0),
             strategy_rsi_overbought=_get_float("STRATEGY_RSI_OVERBOUGHT", 60.0),
             strategy_use_rsi_confirmation=parse_bool_env("STRATEGY_USE_RSI_CONFIRMATION", default=True),
+            # ADX(period) trend-strength gate: only allow trend_pullback
+            # entries when ADX exceeds this threshold — prevents entries
+            # during low-volatility consolidation where pullback signals
+            # tend to whipsaw.
+            strategy_adx_period=_get_int("STRATEGY_ADX_PERIOD", 14),
+            strategy_adx_threshold=_get_float("STRATEGY_ADX_THRESHOLD", 20.0),
+            strategy_use_adx_filter=parse_bool_env("STRATEGY_USE_ADX_FILTER", default=True),
+            # ATR-based take-profit: if set, TP = entry +/- N * ATR
+            # directly, decoupled from risk_reward_ratio. Leave unset
+            # (empty string) to keep the original SL-distance * RR
+            # behavior.
+            strategy_tp_atr_multiplier=(
+                _get_float("STRATEGY_TP_ATR_MULTIPLIER", 0.0)
+                if os.environ.get("STRATEGY_TP_ATR_MULTIPLIER", "").strip() else None
+            ),
             # Daily max drawdown (% of the day's starting equity) before
             # the RiskManager circuit breaker blocks all new orders until
             # the next UTC day.
             risk_max_daily_loss_pct=_get_float("RISK_MAX_DAILY_LOSS_PCT", 5.0),
+            # Max leverage RiskManager will size a position at. NOTE: this
+            # was previously hardcoded to 2.0 directly in main.py with no
+            # config override at all — a real gap for anyone wanting a
+            # different leverage (e.g. 3x) without editing source.
+            risk_max_position_leverage=_get_float("RISK_MAX_POSITION_LEVERAGE", 2.0),
+            risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", 1.0),
             # Candle resolution for live trading + calibration. 1-minute
             # EMA crossovers proved too noisy/fee-heavy in backtesting;
             # default is now 5-minute candles.
             candle_resolution=normalize_candle_resolution(_get_str("CANDLE_RESOLUTION", "5MIN")),
+            # Comma-separated ticker list, e.g. "BTC-USD,ETH-USD,SOL-USD".
+            # Deduplicated, uppercased, order-preserving. Defaults to a
+            # single symbol for backward compatibility with existing
+            # single-asset deployments.
+            tickers=_parse_tickers(_get_str("TICKERS", "ETH-USD")),
+            state_file_path=_get_str("STATE_FILE_PATH", "bot_state.json"),
+            state_persistence_enabled=parse_bool_env("STATE_PERSISTENCE_ENABLED", default=True),
             log_level=_get_str("LOG_LEVEL", "INFO").upper(),
             dotenv_path=_DOTENV_PATH,
         )
@@ -358,6 +428,28 @@ class Settings:
             raise ConfigError("STRATEGY_CONFIRMATION_CANDLES must be at least 1.")
         if not (0 < self.risk_max_daily_loss_pct <= 100):
             raise ConfigError("RISK_MAX_DAILY_LOSS_PCT must be within (0, 100].")
+        if self.risk_max_position_leverage <= 0:
+            raise ConfigError("RISK_MAX_POSITION_LEVERAGE must be positive.")
+        if self.risk_max_position_leverage > 5.0:
+            logger.warning(
+                "RISK_MAX_POSITION_LEVERAGE=%.1fx is unusually high for a small account — "
+                "double-check this is intentional, not a typo.",
+                self.risk_max_position_leverage,
+            )
+        if not (0 < self.risk_per_trade_pct <= 100):
+            raise ConfigError("RISK_PER_TRADE_PCT must be within (0, 100].")
+
+        if not self.tickers:
+            raise ConfigError("TICKERS produced an empty list — at least one symbol is required.")
+        for symbol in self.tickers:
+            if "-" not in symbol:
+                raise ConfigError(
+                    f"TICKERS entry {symbol!r} doesn't look like a valid dYdX v4 market "
+                    f"ticker (expected format like 'ETH-USD')."
+                )
+
+        if not self.state_file_path.strip():
+            raise ConfigError("STATE_FILE_PATH must not be empty.")
 
         valid_strategy_types = {"trend_pullback", "trend_ema"}
         if self.strategy_type not in valid_strategy_types:
@@ -373,6 +465,12 @@ class Settings:
             raise ConfigError("STRATEGY_RSI_OVERSOLD must be within (0, 50).")
         if not (50 < self.strategy_rsi_overbought < 100):
             raise ConfigError("STRATEGY_RSI_OVERBOUGHT must be within (50, 100).")
+        if self.strategy_adx_period <= 0:
+            raise ConfigError("STRATEGY_ADX_PERIOD must be positive.")
+        if self.strategy_adx_threshold < 0:
+            raise ConfigError("STRATEGY_ADX_THRESHOLD must be non-negative.")
+        if self.strategy_tp_atr_multiplier is not None and self.strategy_tp_atr_multiplier <= 0:
+            raise ConfigError("STRATEGY_TP_ATR_MULTIPLIER must be positive when set.")
 
     def summary(self) -> str:
         """Human-readable, secret-redacted summary for startup logs."""
@@ -386,6 +484,7 @@ class Settings:
         )
         return (
             f"mode={'LIVE' if self.dydx_v4_live_trading_enabled else 'PAPER'} "
+            f"| tickers={','.join(self.tickers)} "
             f"| mnemonic={mnemonic_status} "
             f"| node_url={self.dydx_v4_node_url or '(unset)'} "
             f"| indexer_url={self.dydx_v4_indexer_url} "
@@ -393,9 +492,11 @@ class Settings:
             f"| telegram={telegram_status} "
             f"| candle_resolution={self.candle_resolution} "
             f"| strategy={self.strategy_type} ({strategy_detail}) "
+            f"| leverage={self.risk_max_position_leverage:.1f}x "
             f"| cooldown_candles={self.strategy_cooldown_candles} "
             f"| min_atr_pct={self.strategy_min_atr_pct:.3f}% "
             f"| max_daily_loss={self.risk_max_daily_loss_pct:.2f}% "
+            f"| state_file={self.state_file_path} ({'enabled' if self.state_persistence_enabled else 'disabled'}) "
             f"| log_level={self.log_level}"
         )
 

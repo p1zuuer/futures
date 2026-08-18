@@ -151,12 +151,15 @@ class RiskManager:
         used both to (re-)establish the day's starting-equity baseline on
         first call of a new day, and to log current standing.
         """
-        self._maybe_roll_over_day(equity_usd)
-        # First call of a fresh day: use pre-PnL equity as the baseline
-        # rather than post-PnL, so the drawdown % is measured against what
-        # the account actually started the day with.
-        if self._daily_starting_equity is None:
-            self._daily_starting_equity = equity_usd - pnl_usd
+        # Compute pre-PnL equity BEFORE rolling over the day: if this is
+        # the first call of a fresh UTC day, _maybe_roll_over_day sets
+        # _daily_starting_equity from whatever value it's given, so it
+        # must be given the PRE-PnL equity here — otherwise a losing
+        # first trade of the day would understate the day's starting
+        # baseline (using the already-reduced post-loss equity instead),
+        # silently making the drawdown % calculation too lenient.
+        pre_pnl_equity = equity_usd - pnl_usd
+        self._maybe_roll_over_day(pre_pnl_equity)
 
         self._daily_realized_pnl_usd += pnl_usd
 
@@ -204,6 +207,46 @@ class RiskManager:
         roll over. Mainly useful for tests or an explicit operator override."""
         self._kill_switch_active = False
         logger.warning("Daily loss circuit breaker manually reset.")
+
+    def get_state(self) -> dict:
+        """
+        Serialize daily-tracking state to a JSON-safe dict, for restart
+        safety. Without this, a process restart mid-day would silently
+        reset `_daily_starting_equity`/`_daily_realized_pnl_usd` to zero
+        and clear an active kill switch — potentially allowing losses to
+        continue past what should have been a hard daily stop.
+        """
+        return {
+            "current_day": str(self._current_day) if self._current_day else None,
+            "daily_starting_equity": self._daily_starting_equity,
+            "daily_realized_pnl_usd": self._daily_realized_pnl_usd,
+            "kill_switch_active": self._kill_switch_active,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """
+        Restore daily-tracking state previously produced by `get_state()`.
+        If the persisted day differs from today's UTC date, the normal
+        `_maybe_roll_over_day()` logic (triggered by the next
+        `calculate_position`/`record_realized_pnl` call) will correctly
+        reset for the new day — this only matters for a same-day restart.
+        """
+        try:
+            day_str = state.get("current_day")
+            self._current_day = date.fromisoformat(day_str) if day_str else None
+            self._daily_starting_equity = state.get("daily_starting_equity")
+            self._daily_realized_pnl_usd = float(state.get("daily_realized_pnl_usd", 0.0))
+            self._kill_switch_active = bool(state.get("kill_switch_active", False))
+            logger.info(
+                "RiskManager daily state restored | day=%s realized_pnl=$%.4f "
+                "kill_switch_active=%s",
+                self._current_day, self._daily_realized_pnl_usd, self._kill_switch_active,
+            )
+        except (ValueError, TypeError) as exc:
+            logger.error(
+                "Failed to restore RiskManager daily state (%s) — starting fresh "
+                "instead of a corrupted/partial one.", exc,
+            )
 
     def calculate_position(
         self,

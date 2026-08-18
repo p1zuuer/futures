@@ -203,6 +203,36 @@ class TrendEmaStrategy:
         else:
             self._last_stop_out[symbol].pop(self._normalize_side(side), None)
 
+    def get_cooldown_state(self) -> dict:
+        """
+        Serialize all active cooldowns to a JSON-safe dict:
+        {symbol: {side: iso_timestamp}}. Used for restart-safety
+        persistence — cooldown state lives only in this in-process dict
+        otherwise, and would be silently wiped by a process restart.
+        """
+        return {
+            symbol: {side: ts.isoformat() for side, ts in sides.items()}
+            for symbol, sides in self._last_stop_out.items()
+        }
+
+    def restore_cooldown_state(self, state: dict) -> None:
+        """Restore cooldowns previously produced by `get_cooldown_state()`."""
+        restored: Dict[str, Dict[str, pd.Timestamp]] = {}
+        try:
+            for symbol, sides in state.items():
+                restored[symbol] = {
+                    side: pd.Timestamp(ts) for side, ts in sides.items()
+                }
+            self._last_stop_out = restored
+            total = sum(len(sides) for sides in restored.values())
+            logger.info("Cooldown state restored | %d active cooldown(s) across %d symbol(s)",
+                        total, len(restored))
+        except (AttributeError, ValueError, TypeError) as exc:
+            logger.error(
+                "Failed to restore cooldown state (%s) — starting with no active "
+                "cooldowns instead of a corrupted/partial one.", exc,
+            )
+
     @staticmethod
     def _normalize_side(side: str) -> str:
         """Map BUY/LONG -> LONG and SELL/SHORT -> SHORT for consistent

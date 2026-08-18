@@ -482,7 +482,7 @@ def _analyze_pullback_at(
     last_closed = indicators.iloc[i - 1]
     prev_closed = indicators.iloc[i - 2]
 
-    required_fields = ["ema_trend", "ema_pullback", "rsi", "atr"]
+    required_fields = ["ema_trend", "ema_pullback", "rsi", "atr", "adx"]
     if last_closed[required_fields].isna().any() or prev_closed[required_fields].isna().any():
         return None
 
@@ -492,6 +492,7 @@ def _analyze_pullback_at(
     ema_pullback_prev = float(prev_closed["ema_pullback"])
     close_prev = float(prev_closed["close"])
     rsi_prev = float(prev_closed["rsi"])
+    adx_now = float(last_closed["adx"])
 
     macro_uptrend = close_now > ema_trend_now
     macro_downtrend = close_now < ema_trend_now
@@ -525,6 +526,10 @@ def _analyze_pullback_at(
     side = raw_side
     reason = None
 
+    if side != "HOLD" and strategy.use_adx_filter and adx_now < strategy.adx_threshold:
+        reason = "weak_trend_adx"
+        side = "HOLD"
+
     if side != "HOLD" and atr_pct < strategy.min_atr_pct:
         reason = "low_volatility"
         side = "HOLD"
@@ -534,7 +539,11 @@ def _analyze_pullback_at(
         side = "HOLD"
 
     sl_distance = atr_value * strategy.atr_multiplier
-    tp_distance = sl_distance * strategy.risk_reward_ratio
+    tp_distance = (
+        atr_value * strategy.tp_atr_multiplier
+        if strategy.tp_atr_multiplier is not None
+        else sl_distance * strategy.risk_reward_ratio
+    )
     if side == "BUY":
         stop_loss = entry_price - sl_distance
         take_profit = entry_price + tp_distance
@@ -566,6 +575,10 @@ def run_backtest_pullback(
     atr_period: int = 14,
     atr_multiplier: float = 1.5,
     risk_reward_ratio: float = 2.0,
+    tp_atr_multiplier: Optional[float] = None,
+    adx_period: int = 14,
+    adx_threshold: float = 20.0,
+    use_adx_filter: bool = True,
 ) -> Tuple[List[TradeResult], SignalFunnel, TrendPullbackStrategy]:
     """
     Walk-forward, single-position backtest for `TrendPullbackStrategy`,
@@ -588,6 +601,10 @@ def run_backtest_pullback(
         atr_period=atr_period,
         atr_multiplier=atr_multiplier,
         risk_reward_ratio=risk_reward_ratio,
+        tp_atr_multiplier=tp_atr_multiplier,
+        adx_period=adx_period,
+        adx_threshold=adx_threshold,
+        use_adx_filter=use_adx_filter,
         cooldown_candles=cooldown_candles,
         min_atr_pct=min_atr_pct,
     )
@@ -598,7 +615,7 @@ def run_backtest_pullback(
     trades: List[TradeResult] = []
     position: Optional[dict] = None
     fee_frac = TAKER_FEE_PCT / 100.0
-    min_start = max(ema_trend, rsi_period, atr_period) + 5
+    min_start = max(ema_trend, rsi_period, atr_period, adx_period * 2) + 5
 
     for i in range(min_start, len(df)):
         current_candle = df.iloc[i]
@@ -887,6 +904,392 @@ def print_recommendations(grid_df: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Multi-asset portfolio backtest
+# --------------------------------------------------------------------------- #
+
+DEFAULT_MULTI_ASSET_SYMBOLS: List[str] = [
+    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD",
+    "LINK-USD", "SUI-USD", "NEAR-USD", "APT-USD",
+]
+
+INTER_SYMBOL_FETCH_DELAY_SECONDS = 1.0  # extra pacing between symbols, on top of inter-page delay
+
+
+@dataclass
+class AssetResult:
+    symbol: str
+    candles_fetched: int
+    trades: List[TradeResult]
+    funnel: SignalFunnel
+    perf: PerformanceStats
+    error: Optional[str] = None
+
+
+@dataclass
+class PortfolioStats:
+    total_trades: int = 0
+    overall_win_rate_pct: float = 0.0
+    aggregate_return_pct: float = 0.0
+    combined_max_drawdown_pct: float = 0.0
+    portfolio_profit_factor: Optional[float] = None
+
+
+def compute_portfolio_stats(asset_results: List[AssetResult]) -> PortfolioStats:
+    """
+    Combine per-asset trades into portfolio-level statistics.
+
+    Methodology (stated explicitly since this involves a real modeling
+    choice, not a single "correct" answer): every asset is treated as an
+    equal 1/N capital allocation of the total portfolio. All trades across
+    all assets are pooled and sorted chronologically by exit time, and a
+    single equity curve is built by applying each trade's return scaled by
+    1/N in that chronological order — approximating N independent,
+    equally-sized sleeves trading concurrently. Win rate and profit factor
+    are computed from the pooled (unweighted) per-trade returns directly,
+    since weighting is uniform across all trades and cancels out in a ratio.
+    """
+    all_trades: List[Tuple[pd.Timestamp, str, TradeResult]] = []
+    for asset in asset_results:
+        for t in asset.trades:
+            all_trades.append((pd.Timestamp(t.exit_time), asset.symbol, t))
+
+    stats = PortfolioStats()
+    if not all_trades:
+        return stats
+
+    all_trades.sort(key=lambda x: x[0])
+    n_assets = len(asset_results)
+    returns = [t.return_pct for _, _, t in all_trades]
+
+    stats.total_trades = len(returns)
+    wins = [r for r in returns if r > 0]
+    losses = [r for r in returns if r <= 0]
+    stats.overall_win_rate_pct = (len(wins) / len(returns) * 100.0) if returns else 0.0
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    stats.portfolio_profit_factor = (
+        (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else None)
+    )
+
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for r in returns:
+        equity *= (1.0 + (r / n_assets) / 100.0)
+        peak = max(peak, equity)
+        drawdown = (peak - equity) / peak * 100.0
+        max_dd = max(max_dd, drawdown)
+
+    stats.combined_max_drawdown_pct = max_dd
+    stats.aggregate_return_pct = (equity - 1.0) * 100.0
+    return stats
+
+
+async def run_multi_asset_backtest(
+    symbols: List[str],
+    days: float,
+    resolution: str,
+    indexer_url: str,
+    ema_trend: int,
+    ema_pullback: int,
+    rsi_period: int,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    use_rsi_confirmation: bool,
+    min_atr_pct: float,
+    cooldown_candles: int,
+    tp_atr_multiplier: Optional[float] = None,
+    adx_period: int = 14,
+    adx_threshold: float = 20.0,
+    use_adx_filter: bool = True,
+) -> List[AssetResult]:
+    """
+    Fetch real historical candles and run the trend_pullback backtest
+    independently for each symbol in `symbols`, with the SAME filter
+    settings across every asset (no per-asset tuning — the whole point is
+    scaling trade frequency by trading more instruments through one
+    consistent, non-curve-fit filter, not loosening the filter itself).
+    """
+    symbol_dfs = await fetch_multi_asset_data(symbols, days, resolution, indexer_url, ema_trend, rsi_period)
+    return run_multi_asset_backtest_from_data(
+        symbol_dfs, ema_trend=ema_trend, ema_pullback=ema_pullback, rsi_period=rsi_period,
+        rsi_oversold=rsi_oversold, rsi_overbought=rsi_overbought, use_rsi_confirmation=use_rsi_confirmation,
+        min_atr_pct=min_atr_pct, cooldown_candles=cooldown_candles, tp_atr_multiplier=tp_atr_multiplier,
+        adx_period=adx_period, adx_threshold=adx_threshold, use_adx_filter=use_adx_filter,
+    )
+
+
+async def fetch_multi_asset_data(
+    symbols: List[str], days: float, resolution: str, indexer_url: str,
+    ema_trend: int, rsi_period: int,
+) -> Dict[str, Optional[pd.DataFrame]]:
+    """
+    Fetch real historical candles for every symbol ONCE, independent of
+    any strategy parameters — so a grid search across ADX thresholds / TP
+    multipliers can reuse the same fetched data for every combo instead of
+    re-fetching (slow, and unnecessary extra load against the Indexer's
+    rate limits) for each point in the grid. A symbol that fails to fetch
+    or has too little data maps to `None` rather than raising, so one bad
+    symbol doesn't kill fetching for the rest.
+    """
+    symbol_dfs: Dict[str, Optional[pd.DataFrame]] = {}
+    for idx, symbol in enumerate(symbols, start=1):
+        logger.info("[%d/%d] Fetching %s @ %s (%.0f days)...", idx, len(symbols), symbol, resolution, days)
+        try:
+            df = await fetch_historical_candles(symbol, days, indexer_url, resolution=resolution)
+        except Exception as exc:  # noqa: BLE001 - one bad symbol shouldn't kill the whole run
+            logger.error("Failed to fetch %s: %s — skipping this symbol.", symbol, exc)
+            symbol_dfs[symbol] = None
+            continue
+
+        if len(df) < max(ema_trend, rsi_period) + 20:
+            logger.warning(
+                "%s: only %d candles fetched — insufficient for EMA(%d) warmup + evaluation. Skipping.",
+                symbol, len(df), ema_trend,
+            )
+            symbol_dfs[symbol] = None
+            continue
+
+        symbol_dfs[symbol] = df
+        if idx < len(symbols):
+            await asyncio.sleep(INTER_SYMBOL_FETCH_DELAY_SECONDS)
+
+    return symbol_dfs
+
+
+def run_multi_asset_backtest_from_data(
+    symbol_dfs: Dict[str, Optional[pd.DataFrame]],
+    ema_trend: int,
+    ema_pullback: int,
+    rsi_period: int,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    use_rsi_confirmation: bool,
+    min_atr_pct: float,
+    cooldown_candles: int,
+    tp_atr_multiplier: Optional[float] = None,
+    adx_period: int = 14,
+    adx_threshold: float = 20.0,
+    use_adx_filter: bool = True,
+) -> List[AssetResult]:
+    """
+    Pure-compute counterpart to `run_multi_asset_backtest`: runs the
+    trend_pullback backtest for each symbol against ALREADY-FETCHED data
+    (from `fetch_multi_asset_data`). No network calls — cheap to call
+    repeatedly across many parameter combinations in a grid search.
+    """
+    results: List[AssetResult] = []
+    for symbol, df in symbol_dfs.items():
+        if df is None:
+            results.append(AssetResult(
+                symbol=symbol, candles_fetched=0, trades=[], funnel=SignalFunnel(),
+                perf=PerformanceStats(), error="no data available (fetch failed or insufficient candles)",
+            ))
+            continue
+
+        trades, funnel, _ = run_backtest_pullback(
+            df, symbol,
+            ema_trend=ema_trend, ema_pullback=ema_pullback, rsi_period=rsi_period,
+            rsi_oversold=rsi_oversold, rsi_overbought=rsi_overbought,
+            use_rsi_confirmation=use_rsi_confirmation,
+            min_atr_pct=min_atr_pct, cooldown_candles=cooldown_candles,
+            tp_atr_multiplier=tp_atr_multiplier, adx_period=adx_period,
+            adx_threshold=adx_threshold, use_adx_filter=use_adx_filter,
+        )
+        perf = compute_performance(trades)
+        results.append(AssetResult(
+            symbol=symbol, candles_fetched=len(df), trades=trades, funnel=funnel, perf=perf,
+        ))
+
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# ADX threshold x ATR-TP-multiplier grid search (multi-asset, pooled)
+# --------------------------------------------------------------------------- #
+
+DEFAULT_ADX_THRESHOLDS: List[float] = [15.0, 20.0, 25.0, 30.0]
+DEFAULT_TP_ATR_MULTIPLIERS: List[float] = [1.5, 2.0, 2.5, 3.0, 4.0]
+
+
+def run_pullback_optimization_grid(
+    symbol_dfs: Dict[str, Optional[pd.DataFrame]],
+    ema_trend: int,
+    ema_pullback: int,
+    rsi_period: int,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    use_rsi_confirmation: bool,
+    min_atr_pct: float,
+    cooldown_candles: int,
+    adx_thresholds: List[float] = DEFAULT_ADX_THRESHOLDS,
+    tp_atr_multipliers: List[float] = DEFAULT_TP_ATR_MULTIPLIERS,
+) -> pd.DataFrame:
+    """
+    Grid-search ADX threshold x ATR-based TP multiplier, evaluated as a
+    pooled multi-asset portfolio (same methodology as
+    `compute_portfolio_stats`) at each grid point, ranked by Profit Factor
+    then Win Rate. `ema_trend`/`ema_pullback` are held fixed across the
+    grid (per the request: optimize the new ADX/TP levers specifically,
+    not re-litigate the EMA periods already chosen).
+    """
+    rows = []
+    total_combos = len(adx_thresholds) * len(tp_atr_multipliers)
+    logger.info(
+        "Running ADX x TP-multiplier grid search: %d ADX thresholds x %d TP multipliers "
+        "= %d combos, evaluated across %d asset(s)...",
+        len(adx_thresholds), len(tp_atr_multipliers), total_combos, len(symbol_dfs),
+    )
+
+    for adx_threshold in adx_thresholds:
+        for tp_mult in tp_atr_multipliers:
+            asset_results = run_multi_asset_backtest_from_data(
+                symbol_dfs, ema_trend=ema_trend, ema_pullback=ema_pullback, rsi_period=rsi_period,
+                rsi_oversold=rsi_oversold, rsi_overbought=rsi_overbought,
+                use_rsi_confirmation=use_rsi_confirmation, min_atr_pct=min_atr_pct,
+                cooldown_candles=cooldown_candles, tp_atr_multiplier=tp_mult,
+                adx_threshold=adx_threshold, use_adx_filter=True,
+            )
+            valid_results = [a for a in asset_results if a.error is None]
+            portfolio = compute_portfolio_stats(valid_results)
+            rows.append({
+                "adx_threshold": adx_threshold,
+                "tp_atr_multiplier": tp_mult,
+                "total_trades": portfolio.total_trades,
+                "win_rate_pct": round(portfolio.overall_win_rate_pct, 2),
+                "profit_factor": (
+                    round(portfolio.portfolio_profit_factor, 3)
+                    if isinstance(portfolio.portfolio_profit_factor, float)
+                    and portfolio.portfolio_profit_factor != float("inf")
+                    else portfolio.portfolio_profit_factor
+                ),
+                "max_drawdown_pct": round(portfolio.combined_max_drawdown_pct, 3),
+                "aggregate_return_pct": round(portfolio.aggregate_return_pct, 3),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def print_optimization_recommendations(grid_df: pd.DataFrame, symbols: List[str]) -> None:
+    print("\n" + "=" * 78)
+    print(f"ADX x ATR-TP-MULTIPLIER GRID SEARCH — pooled portfolio across {', '.join(symbols)}")
+    print("=" * 78)
+
+    eligible = grid_df[grid_df["total_trades"] >= MIN_TRADES_FOR_RECOMMENDATION].copy()
+    if eligible.empty:
+        print(
+            f"No combination produced >= {MIN_TRADES_FOR_RECOMMENDATION} pooled trades — "
+            f"the sample is too small across this grid to recommend settings with "
+            f"confidence. Showing the full grid sorted by trade count instead:\n"
+        )
+        print(grid_df.sort_values("total_trades", ascending=False).head(10).to_string(index=False))
+        return
+
+    eligible["pf_sort"] = eligible["profit_factor"].apply(
+        lambda x: x if isinstance(x, (int, float)) and x != float("inf") else -1
+    )
+    ranked = eligible.sort_values(
+        by=["pf_sort", "win_rate_pct", "aggregate_return_pct"], ascending=[False, False, False]
+    )
+
+    print(f"Top combinations (min {MIN_TRADES_FOR_RECOMMENDATION} pooled trades required):\n")
+    print(
+        ranked[["adx_threshold", "tp_atr_multiplier", "total_trades", "win_rate_pct",
+                "profit_factor", "max_drawdown_pct", "aggregate_return_pct"]]
+        .head(10)
+        .to_string(index=False)
+    )
+
+    best = ranked.iloc[0]
+    print(f"\nRecommended starting point based on this grid:")
+    print(f"  STRATEGY_ADX_THRESHOLD={best['adx_threshold']}")
+    print(f"  STRATEGY_TP_ATR_MULTIPLIER={best['tp_atr_multiplier']}")
+    print(
+        f"  ({int(best['total_trades'])} pooled trades, {best['win_rate_pct']:.1f}% win rate, "
+        f"profit factor {best['profit_factor']}, max DD {best['max_drawdown_pct']:.2f}%)"
+    )
+    print(
+        "\n⚠️  Same overfitting caveat as every other grid search in this tool: this is "
+        "the best combination on ONE historical window across a handful of assets — a "
+        "starting point to validate further (more days, out-of-sample period, or paper "
+        "trading), not a number to deploy blindly. A grid search will always produce a "
+        "'winner' even from pure noise; trust it more as the trade count grows."
+    )
+
+
+def print_multi_asset_report(
+    asset_results: List[AssetResult], resolution: str, days: float,
+    ema_trend: int, ema_pullback: int,
+) -> None:
+    print("\n" + "=" * 78)
+    print(f"PER-ASSET RESULTS — trend_pullback @ {resolution}, ema_trend={ema_trend}, "
+          f"ema_pullback={ema_pullback}, ~{days:.0f} days")
+    print("=" * 78)
+
+    rows = []
+    for asset in asset_results:
+        if asset.error:
+            print(f"\n{asset.symbol}: SKIPPED ({asset.error})")
+            continue
+        p = asset.perf
+        pf_str = (
+            f"{p.profit_factor:.3f}" if isinstance(p.profit_factor, float) and p.profit_factor != float("inf")
+            else str(p.profit_factor)
+        )
+        rows.append({
+            "symbol": asset.symbol,
+            "candles": asset.candles_fetched,
+            "trades": p.total_trades,
+            "win_rate_pct": round(p.win_rate_pct, 2),
+            "profit_factor": pf_str,
+            "max_dd_pct": round(p.max_drawdown_pct, 3),
+            "total_return_pct": round(p.total_return_pct, 3),
+        })
+
+    if rows:
+        table_df = pd.DataFrame(rows)
+        print("\n" + table_df.to_string(index=False))
+
+        low_sample = [r["symbol"] for r in rows if r["trades"] < MIN_TRADES_FOR_RECOMMENDATION]
+        if low_sample:
+            print(
+                f"\n⚠️  Low sample size (< {MIN_TRADES_FOR_RECOMMENDATION} trades) for: "
+                f"{', '.join(low_sample)} — treat their individual numbers as directional only."
+            )
+
+    portfolio = compute_portfolio_stats(asset_results)
+    print("\n" + "=" * 78)
+    print("CONSOLIDATED PORTFOLIO SUMMARY")
+    print("=" * 78)
+    print(f"Assets included:            {len([a for a in asset_results if not a.error])}/{len(asset_results)}")
+    print(f"Total trades (all assets):  {portfolio.total_trades}")
+    print(f"Overall win rate:           {portfolio.overall_win_rate_pct:.2f}%")
+    pf_display = (
+        f"{portfolio.portfolio_profit_factor:.3f}"
+        if isinstance(portfolio.portfolio_profit_factor, float) and portfolio.portfolio_profit_factor != float("inf")
+        else str(portfolio.portfolio_profit_factor)
+    )
+    print(f"Portfolio profit factor:    {pf_display}")
+    print(f"Combined max drawdown:      {portfolio.combined_max_drawdown_pct:.3f}%")
+    print(f"Aggregate return:           {portfolio.aggregate_return_pct:+.3f}%")
+    print(
+        "\nMethodology: each asset is treated as an equal 1/N capital sleeve; all trades "
+        "across all assets are pooled in chronological (exit-time) order to build one "
+        "portfolio equity curve. Win rate and profit factor are computed from pooled, "
+        "unweighted per-trade returns."
+    )
+    if portfolio.total_trades < MIN_TRADES_FOR_RECOMMENDATION * 2:
+        print(
+            f"\n⚠️  Only {portfolio.total_trades} total trades across the whole portfolio — "
+            f"still a fairly small sample even pooled across {len(asset_results)} assets. "
+            f"Scaling to more instruments increases trade count, but a genuinely selective "
+            f"filter (macro trend + pullback + RSI, all at 1H) may still need more --days "
+            f"before the portfolio numbers are trustworthy."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
 
@@ -918,6 +1321,34 @@ async def main() -> None:
         "--ema-pullback", type=int, default=None,
         help="Override trend_pullback's short-term pullback EMA period (default from config.settings.strategy_ema_pullback).",
     )
+    parser.add_argument(
+        "--multi", action="store_true",
+        help="Run a multi-asset trend_pullback portfolio backtest across --symbols instead "
+             "of the single-symbol --symbol flow, printing per-asset metrics plus a "
+             "consolidated portfolio summary.",
+    )
+    parser.add_argument(
+        "--symbols", default=None,
+        help="Comma-separated ticker list for --multi/--optimize (default: "
+             f"{','.join(DEFAULT_MULTI_ASSET_SYMBOLS)}).",
+    )
+    parser.add_argument(
+        "--optimize", action="store_true",
+        help="Grid-search ADX threshold x ATR-based TP multiplier for trend_pullback, "
+             "evaluated as a pooled portfolio across --symbols (fetches data once, reuses "
+             "it across every grid combo). Implies --multi-style multi-asset fetching; "
+             "--symbols defaults to the same list as --multi if not given.",
+    )
+    parser.add_argument(
+        "--adx-thresholds", default=None,
+        help=f"Comma-separated ADX thresholds to grid-search with --optimize "
+             f"(default: {','.join(str(x) for x in DEFAULT_ADX_THRESHOLDS)}).",
+    )
+    parser.add_argument(
+        "--tp-multipliers", default=None,
+        help=f"Comma-separated ATR-based TP multipliers to grid-search with --optimize "
+             f"(default: {','.join(str(x) for x in DEFAULT_TP_ATR_MULTIPLIERS)}).",
+    )
     parser.add_argument("--indexer-url", default=None, help="Override the Indexer base URL (defaults to config.settings / mainnet).")
     parser.add_argument("--cache-file", default=None, help="CSV path to cache/reuse fetched candles.")
     parser.add_argument("--skip-grid-search", action="store_true", help="Skip the EMA/ATR grid search for trend_ema (faster).")
@@ -939,6 +1370,82 @@ async def main() -> None:
         indexer_url = normalize_and_validate_indexer_url(args.indexer_url)
     else:
         indexer_url = settings.dydx_v4_indexer_url
+
+    if args.optimize:
+        symbols = (
+            [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols else DEFAULT_MULTI_ASSET_SYMBOLS
+        )
+        ema_trend = args.ema_trend if args.ema_trend is not None else settings.strategy_ema_trend
+        ema_pullback = args.ema_pullback if args.ema_pullback is not None else settings.strategy_ema_pullback
+        adx_thresholds = (
+            [float(x.strip()) for x in args.adx_thresholds.split(",") if x.strip()]
+            if args.adx_thresholds else DEFAULT_ADX_THRESHOLDS
+        )
+        tp_multipliers = (
+            [float(x.strip()) for x in args.tp_multipliers.split(",") if x.strip()]
+            if args.tp_multipliers else DEFAULT_TP_ATR_MULTIPLIERS
+        )
+
+        logger.info(
+            "Optimize mode | symbols=%s @ %s, ~%.0f days, ema_trend=%d, ema_pullback=%d, "
+            "%d ADX thresholds x %d TP multipliers = %d grid points (data fetched once, "
+            "reused across every combo)...",
+            symbols, resolution, args.days, ema_trend, ema_pullback,
+            len(adx_thresholds), len(tp_multipliers), len(adx_thresholds) * len(tp_multipliers),
+        )
+
+        symbol_dfs = await fetch_multi_asset_data(
+            symbols, args.days, resolution, indexer_url, ema_trend, settings.strategy_rsi_period,
+        )
+        n_available = sum(1 for df in symbol_dfs.values() if df is not None)
+        if n_available == 0:
+            logger.error("No symbols had sufficient data fetched — cannot run the grid search.")
+            return
+
+        grid_df = run_pullback_optimization_grid(
+            symbol_dfs, ema_trend=ema_trend, ema_pullback=ema_pullback,
+            rsi_period=settings.strategy_rsi_period, rsi_oversold=settings.strategy_rsi_oversold,
+            rsi_overbought=settings.strategy_rsi_overbought,
+            use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
+            min_atr_pct=settings.strategy_min_atr_pct, cooldown_candles=settings.strategy_cooldown_candles,
+            adx_thresholds=adx_thresholds, tp_atr_multipliers=tp_multipliers,
+        )
+        print_optimization_recommendations(grid_df, symbols)
+        return
+
+    if args.multi:
+        symbols = (
+            [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols else DEFAULT_MULTI_ASSET_SYMBOLS
+        )
+        ema_trend = args.ema_trend if args.ema_trend is not None else settings.strategy_ema_trend
+        ema_pullback = args.ema_pullback if args.ema_pullback is not None else settings.strategy_ema_pullback
+
+        est_seconds = len(symbols) * (args.days * 24 * 60 / (5 if "MIN" in resolution else 60)) * 0.01
+        logger.info(
+            "Multi-asset backtest | %d symbols @ %s, ~%.0f days each, ema_trend=%d, "
+            "ema_pullback=%d (rough estimate: a few minutes, dominated by fetch pagination "
+            "+ rate-limit pacing, not compute)...",
+            len(symbols), resolution, args.days, ema_trend, ema_pullback,
+        )
+
+        asset_results = await run_multi_asset_backtest(
+            symbols=symbols, days=args.days, resolution=resolution, indexer_url=indexer_url,
+            ema_trend=ema_trend, ema_pullback=ema_pullback,
+            rsi_period=settings.strategy_rsi_period,
+            rsi_oversold=settings.strategy_rsi_oversold,
+            rsi_overbought=settings.strategy_rsi_overbought,
+            use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
+            min_atr_pct=settings.strategy_min_atr_pct,
+            cooldown_candles=settings.strategy_cooldown_candles,
+            tp_atr_multiplier=settings.strategy_tp_atr_multiplier,
+            adx_period=settings.strategy_adx_period,
+            adx_threshold=settings.strategy_adx_threshold,
+            use_adx_filter=settings.strategy_use_adx_filter,
+        )
+        print_multi_asset_report(asset_results, resolution, args.days, ema_trend, ema_pullback)
+        return
 
     logger.info("Calibration run | symbol=%s resolution=%s days=%.1f strategy=%s",
                 args.symbol, resolution, args.days, args.strategy)
