@@ -538,7 +538,7 @@ def _analyze_pullback_at(
         reason = "cooldown_active"
         side = "HOLD"
 
-    sl_distance = atr_value * strategy.atr_multiplier
+    sl_distance = atr_value * strategy.atr_multiplier_sl
     tp_distance = (
         atr_value * strategy.tp_atr_multiplier
         if strategy.tp_atr_multiplier is not None
@@ -599,7 +599,8 @@ def run_backtest_pullback(
         rsi_overbought=rsi_overbought,
         use_rsi_confirmation=use_rsi_confirmation,
         atr_period=atr_period,
-        atr_multiplier=atr_multiplier,
+        atr_multiplier_sl=atr_multiplier,
+        atr_multiplier_tp=atr_multiplier * risk_reward_ratio if tp_atr_multiplier is None else tp_atr_multiplier,
         risk_reward_ratio=risk_reward_ratio,
         tp_atr_multiplier=tp_atr_multiplier,
         adx_period=adx_period,
@@ -1223,7 +1224,7 @@ def print_multi_asset_report(
     ema_trend: int, ema_pullback: int,
 ) -> None:
     print("\n" + "=" * 78)
-    print(f"PER-ASSET RESULTS — trend_pullback @ {resolution}, ema_trend={ema_trend}, "
+    print(f"PER-ASSET RESULTS - trend_pullback @ {resolution}, ema_trend={ema_trend}, "
           f"ema_pullback={ema_pullback}, ~{days:.0f} days")
     print("=" * 78)
 
@@ -1512,6 +1513,7 @@ async def main() -> None:
             use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
             min_atr_pct=settings.strategy_min_atr_pct,
             cooldown_candles=settings.strategy_cooldown_candles,
+            atr_multiplier=getattr(settings, "strategy_atr_multiplier", 1.5),
         )
         pullback_perf = compute_performance(trades_pb)
         print_funnel_report(funnel_pb, label="TREND-PULLBACK (new)")
