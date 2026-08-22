@@ -89,9 +89,28 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-# --------------------------------------------------------------------------- #
-# Synthetic market data feed
-# --------------------------------------------------------------------------- #
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+def _run_health_check_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, format: str, *args) -> None:
+            # Suppress HTTP server request logs to keep stdout clean
+            pass
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        logger.info("Health check HTTP server started on port %d", port)
+        server.serve_forever()
+    except Exception as exc:
+        logger.error("Failed to start health check HTTP server on port %d: %s", port, exc)
 
 class MarketDataFeed:
     """
@@ -1045,6 +1064,10 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
+    # Start the background HTTP server daemon thread for Render web service health check port binding
+    _http_thread = threading.Thread(target=_run_health_check_server, daemon=True)
+    _http_thread.start()
+
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
