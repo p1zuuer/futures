@@ -593,7 +593,7 @@ def run_backtest_pullback(
     rsi_oversold: float = 45.0,
     rsi_overbought: float = 55.0,
     use_rsi_confirmation: bool = True,
-    min_atr_pct: float = 0.08,
+    min_atr_pct: float = 0.4,
     cooldown_candles: int = 5,
     atr_period: int = 14,
     atr_multiplier_sl: float = 1.5,
@@ -602,10 +602,10 @@ def run_backtest_pullback(
     risk_reward_ratio: float = 2.0,
     tp_atr_multiplier: Optional[float] = None,
     adx_period: int = 14,
-    adx_threshold: float = 18.0,
+    adx_threshold: float = 14.0,
     use_adx_filter: bool = True,
     volume_ma_period: int = 20,
-    volume_spike_threshold: float = 1.1,
+    volume_spike_threshold: float = 1.03,
     use_volume_confirmation: bool = True,
 ) -> Tuple[List[TradeResult], SignalFunnel, TrendPullbackStrategy]:
     """
@@ -894,7 +894,7 @@ def print_performance_report(perf: PerformanceStats, label: str) -> None:
     print(f"Total return:      {perf.total_return_pct:+.3f}% (1x notional, fees included, no leverage)")
     if perf.total_trades < MIN_TRADES_FOR_RECOMMENDATION:
         print(
-            f"\n⚠️  Only {perf.total_trades} trades in this window — too few to draw strong "
+            f"\n[!] Only {perf.total_trades} trades in this window - too few to draw strong "
             f"conclusions (recommend re-running with more days once available)."
         )
 
@@ -938,8 +938,8 @@ def print_recommendations(grid_df: pd.DataFrame) -> None:
         f"profit factor {best['profit_factor']}, max DD {best['max_drawdown_pct']:.2f}%)"
     )
     print(
-        "\n⚠️  This is calibrated on ONE historical window and is a starting point, not a "
-        "guarantee — re-run periodically and treat any single-window 'best' combo with "
+        "\n[!] This is calibrated on ONE historical window and is a starting point, not a "
+        "guarantee - re-run periodically and treat any single-window 'best' combo with "
         "healthy skepticism, especially with trade counts under a few dozen."
     )
 
@@ -1295,8 +1295,8 @@ def print_multi_asset_report(
         low_sample = [r["symbol"] for r in rows if r["trades"] < MIN_TRADES_FOR_RECOMMENDATION]
         if low_sample:
             print(
-                f"\n⚠️  Low sample size (< {MIN_TRADES_FOR_RECOMMENDATION} trades) for: "
-                f"{', '.join(low_sample)} — treat their individual numbers as directional only."
+                f"\n[!] Low sample size (< {MIN_TRADES_FOR_RECOMMENDATION} trades) for: "
+                f"{', '.join(low_sample)} - treat their individual numbers as directional only."
             )
 
     portfolio = compute_portfolio_stats(asset_results)
@@ -1322,7 +1322,7 @@ def print_multi_asset_report(
     )
     if portfolio.total_trades < MIN_TRADES_FOR_RECOMMENDATION * 2:
         print(
-            f"\n⚠️  Only {portfolio.total_trades} total trades across the whole portfolio — "
+            f"\n[!] Only {portfolio.total_trades} total trades across the whole portfolio - "
             f"still a fairly small sample even pooled across {len(asset_results)} assets. "
             f"Scaling to more instruments increases trade count, but a genuinely selective "
             f"filter (macro trend + pullback + RSI, all at 1H) may still need more --days "
@@ -1603,8 +1603,8 @@ async def main() -> None:
         min_trades_either = min(ema_perf.total_trades, pullback_perf.total_trades)
         if min_trades_either < MIN_TRADES_FOR_RECOMMENDATION:
             print(
-                f"\n⚠️  At least one strategy produced fewer than "
-                f"{MIN_TRADES_FOR_RECOMMENDATION} trades over this window — treat this "
+                f"\n[!] At least one strategy produced fewer than "
+                f"{MIN_TRADES_FOR_RECOMMENDATION} trades over this window - treat this "
                 f"comparison as directional only, not a confident verdict. Re-run with "
                 f"more --days once more history is available."
             )
