@@ -1395,10 +1395,9 @@ async def main() -> None:
     parser.add_argument("--skip-grid-search", action="store_true", help="Skip the EMA/ATR grid search for trend_ema (faster).")
     args = parser.parse_args()
 
-    if args.days < 1 or args.days > 90:
+    if args.days < 1 or args.days > 400:
         parser.error(
-            "--days should be between 1 and 90 (3-7 for 1MIN/5MIN; 30-90 for 1HOUR/4HOURS "
-            "to get a large enough trade sample and cover EMA200's ~8+ day warmup)."
+            "--days should be between 1 and 400."
         )
 
     from config import settings, normalize_candle_resolution
