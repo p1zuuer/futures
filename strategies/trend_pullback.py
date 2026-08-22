@@ -300,10 +300,30 @@ class TrendPullbackStrategy:
             long_setup = long_setup and (rsi_prev <= self.rsi_oversold)
             short_setup = short_setup and (rsi_prev >= self.rsi_overbought)
 
-        if self.use_volume_confirmation and vol_ma_now > 0:
-            volume_ok = volume_now >= (vol_ma_now * self.volume_spike_threshold)
-            long_setup = long_setup and volume_ok
-            short_setup = short_setup and volume_ok
+        if self.use_volume_confirmation:
+            if vol_ma_now > 0:
+                volume_ok = volume_now >= (vol_ma_now * self.volume_spike_threshold)
+                long_setup = long_setup and volume_ok
+                short_setup = short_setup and volume_ok
+            elif long_setup or short_setup:
+                # vol_ma_now <= 0 means we can't actually evaluate the
+                # volume-spike condition (missing/zero volume data from
+                # the exchange — not unusual on thinner alts during quiet
+                # hours). Silently skipping the filter here would let a
+                # setup through UNCONFIRMED by volume without any trace in
+                # the logs — exactly the kind of silent failure a
+                # production audit needs to catch. Log it explicitly and
+                # fail safe (suppress the signal) rather than silently
+                # bypassing a configured risk control.
+                logger.warning(
+                    "Volume confirmation could not be evaluated for this candle "
+                    "(vol_ma=%.4f <= 0, likely missing/zero volume data) — "
+                    "suppressing the %s setup rather than silently letting it "
+                    "through unconfirmed.",
+                    vol_ma_now, "long" if long_setup else "short",
+                )
+                long_setup = False
+                short_setup = False
 
         raw_side: SignalSide
         if long_setup:
@@ -322,7 +342,13 @@ class TrendPullbackStrategy:
         last_closed_ts = pd.Timestamp(candle_timestamp)
         try:
             candle_interval: Optional[pd.Timedelta] = last_closed_ts - pd.Timestamp(prev_timestamp)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            # Falls back to a safe default (5 minutes, used by
+            # _cooldown_active when interval is None) — not fatal, but
+            # worth a trace-level breadcrumb rather than being fully
+            # invisible, since a malformed timestamp is itself a signal
+            # something upstream (candle data) may be off.
+            logger.debug("Could not compute candle interval from timestamps: %s", exc)
             candle_interval = None
 
         side: SignalSide = raw_side

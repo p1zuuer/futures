@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "saved_at": "2026-08-18T18:07:42.712225+00:00",
+  "symbols": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD"
+  ],
+  "cooldowns": {},
+  "daily_risk": {
+    "current_day": null,
+    "daily_starting_equity": null,
+    "daily_realized_pnl_usd": 0.0,
+    "kill_switch_active": false
+  },
+  "open_conditional_orders": {},
+  "paper_account": {
+    "balance_usd": 15.0,
+    "equity_usd": 15.0,
+    "open_positions": {},
+    "pending_orders": {},
+    "last_prices": {
+      "BTC-USD": 64662.0,
+      "ETH-USD": 1912.7,
+      "SOL-USD": 76.82
+    }
+  }
+}

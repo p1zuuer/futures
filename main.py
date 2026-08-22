@@ -74,7 +74,7 @@ from exchange.paper_exchange import (
 from risk.manager import PositionPlan, RiskManager
 from services.telegram_notifier import TelegramNotifier
 from state.persistence import BotStateStore
-from strategies.trend_ema import Signal, TrendEmaStrategy
+from strategies.trend_ema import Signal, StrategyError, TrendEmaStrategy
 from strategies.trend_pullback import TrendPullbackStrategy
 
 logger = logging.getLogger("trading_bot")
@@ -306,10 +306,16 @@ class TradingBot:
                 rsi_oversold=settings.strategy_rsi_oversold,
                 rsi_overbought=settings.strategy_rsi_overbought,
                 use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
+                atr_multiplier_sl=settings.strategy_atr_multiplier_sl,
+                atr_multiplier_tp=settings.strategy_atr_multiplier_tp,
+                use_dynamic_atr_stops=settings.strategy_use_dynamic_atr_stops,
                 tp_atr_multiplier=settings.strategy_tp_atr_multiplier,
                 adx_period=settings.strategy_adx_period,
                 adx_threshold=settings.strategy_adx_threshold,
                 use_adx_filter=settings.strategy_use_adx_filter,
+                volume_ma_period=settings.strategy_volume_ma_period,
+                volume_spike_threshold=settings.strategy_volume_spike_threshold,
+                use_volume_confirmation=settings.strategy_use_volume_confirmation,
                 cooldown_candles=settings.strategy_cooldown_candles,
                 min_atr_pct=settings.strategy_min_atr_pct,
             )
@@ -342,6 +348,11 @@ class TradingBot:
         # used to cancel the sibling leg once a position closes, since
         # dYdX v4 does not auto-cancel it; see _cancel_stale_conditional_orders.
         self._open_conditional_orders: Dict[str, dict] = {}
+        # Strong references to fire-and-forget background tasks (Telegram
+        # alerts) — asyncio only holds a weak reference to a task created
+        # via create_task/ensure_future, so without this the task can be
+        # garbage-collected mid-flight. See _fire_and_forget().
+        self._background_tasks: set = set()
 
         logger.info(
             "TradingBot initialized | symbols=%s initial_balance=$%.2f telegram=%s "
@@ -357,11 +368,61 @@ class TradingBot:
     # up into the trading loop)
     # ------------------------------------------------------------------ #
 
-    async def _notify_signal(self, signal: Signal) -> None:
+    def _fire_and_forget(self, coro, description: str) -> None:
+        """
+        Schedule `coro` as a background task instead of awaiting it inline.
+        This is what actually guarantees a slow/hung Telegram API call can
+        NEVER block the main trading loop — a plain `await
+        self.notifier.send_*(...)` would stall SL/TP checks and order
+        placement for every OTHER symbol in the same tick round until
+        Telegram responds (or its internal timeout fires, if any).
+
+        Keeps a strong reference in `self._background_tasks` (asyncio only
+        holds a WEAK reference to a task created via create_task/
+        ensure_future — without an explicit strong reference held
+        elsewhere, the task object can be garbage-collected mid-flight,
+        silently cancelling it) and logs any exception the task raises via
+        a done-callback, since nothing else will ever await it to surface
+        that exception otherwise.
+        """
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+
+        def _on_done(t: "asyncio.Task") -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning("Background task failed (%s): %s", description, exc)
+
+        task.add_done_callback(_on_done)
+
+    async def _drain_background_tasks(self, timeout: float = 5.0) -> None:
+        """Best-effort wait for in-flight fire-and-forget tasks (e.g. a
+        final position-closed alert) to finish before shutdown, without
+        blocking shutdown indefinitely if one is stuck."""
+        if not self._background_tasks:
+            return
         try:
-            await self.notifier.send_signal_alert(signal.to_dict())
-        except Exception as exc:  # noqa: BLE001 - never let alerts break trading
-            logger.warning("Failed to send signal alert: %s", exc)
+            await asyncio.wait(self._background_tasks, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - never block shutdown on this
+            logger.warning("Error while draining background tasks: %s", exc)
+
+    def _notify_error_fire_and_forget(self, text: str) -> None:
+        """Best-effort raw-text alert for unexpected (non-routine) errors,
+        e.g. a genuine bug surfacing from strategy.analyze(). Uses the
+        notifier's underlying _send() directly since this isn't one of
+        the three structured alert types."""
+        send_method = getattr(self.notifier, "_send", None)
+        if callable(send_method):
+            self._fire_and_forget(send_method(text), description="error alert")
+
+    async def _notify_signal(self, signal: Signal) -> None:
+        self._fire_and_forget(
+            self.notifier.send_signal_alert(signal.to_dict()),
+            description=f"signal alert ({signal.symbol})",
+        )
 
     async def _cancel_stale_conditional_orders(self, symbol: str, triggered_reason: str) -> None:
         """
@@ -411,8 +472,8 @@ class TradingBot:
         quantity: float,
         fee: float,
     ) -> None:
-        try:
-            await self.notifier.send_order_executed_alert(
+        self._fire_and_forget(
+            self.notifier.send_order_executed_alert(
                 {
                     "order_id": order_id,
                     "symbol": symbol,
@@ -420,9 +481,9 @@ class TradingBot:
                     "quantity": quantity,
                     "fee": fee,
                 }
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to send order executed alert: %s", exc)
+            ),
+            description=f"order executed alert ({symbol})",
+        )
 
     async def _notify_position_closed(
         self,
@@ -433,8 +494,8 @@ class TradingBot:
         reason: str,
         new_balance: float,
     ) -> None:
-        try:
-            await self.notifier.send_position_closed_alert(
+        self._fire_and_forget(
+            self.notifier.send_position_closed_alert(
                 {
                     "symbol": symbol,
                     "exit_price": exit_price,
@@ -443,9 +504,9 @@ class TradingBot:
                     "reason": reason,
                     "new_balance": new_balance,
                 }
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to send position closed alert: %s", exc)
+            ),
+            description=f"position closed alert ({symbol})",
+        )
 
     # ------------------------------------------------------------------ #
     # Strategy evaluation + order placement
@@ -455,8 +516,27 @@ class TradingBot:
         """Run the strategy when flat and place a sized order on BUY/SELL."""
         try:
             signal: Signal = self.strategy.analyze(symbol, df)
-        except Exception as exc:  # InsufficientDataError / InvalidDataFrameError
+        except StrategyError as exc:
+            # Expected, routine conditions (not enough warmed-up candles
+            # yet, missing OHLCV columns) — genuinely fine to happen every
+            # tick during warmup, so DEBUG is appropriate here.
             logger.debug("Strategy analysis skipped for %s: %s", symbol, exc)
+            return
+        except Exception as exc:  # noqa: BLE001
+            # Anything else (TypeError/KeyError/AttributeError from
+            # malformed or unexpectedly-shaped candle data, a real bug in
+            # the strategy, etc.) must NEVER be silently swallowed — this
+            # is exactly the "silent failure" a production audit needs to
+            # catch. Logged at ERROR with full traceback and surfaced to
+            # Telegram (best-effort) so an operator actually sees it
+            # instead of the bot quietly skipping every tick for a symbol.
+            logger.error(
+                "UNEXPECTED error during strategy.analyze() for %s — this is NOT a "
+                "routine condition, investigate: %s", symbol, exc, exc_info=True,
+            )
+            self._notify_error_fire_and_forget(
+                f"⚠️ Unexpected strategy error for {symbol}: {exc!r}"
+            )
             return
 
         if signal.side == "HOLD":
@@ -861,6 +941,12 @@ class TradingBot:
         metrics."""
         self._running = False
 
+        # Give any in-flight fire-and-forget Telegram alerts (e.g. a final
+        # position-closed notification) a bounded chance to finish before
+        # tearing down the notifier — best-effort, never blocks shutdown
+        # indefinitely.
+        await self._drain_background_tasks(timeout=5.0)
+
         await self._save_state()
 
         try:
@@ -910,7 +996,7 @@ class TradingBot:
 async def _main() -> None:
     import signal
 
-    bot = TradingBot(initial_balance=15.0)
+    bot = TradingBot(initial_balance=settings.paper_balance)
     run_task = asyncio.ensure_future(bot.run(poll_interval_seconds=2.0))
 
     loop = asyncio.get_running_loop()

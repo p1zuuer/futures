@@ -274,16 +274,33 @@ class TelegramNotifier:
     # Outbound send primitive
     # ------------------------------------------------------------------ #
 
+    # Hard ceiling on how long a single send can take, independent of any
+    # aiogram/aiohttp-internal timeout. Combined with main.py now firing
+    # these sends as background tasks (never awaited inline in the trading
+    # loop), this is defense-in-depth: even if something upstream hangs
+    # instead of raising, this guarantees the send eventually gives up
+    # and the background task completes rather than accumulating forever.
+    SEND_TIMEOUT_SECONDS = 10.0
+
     async def _send(self, text: str) -> None:
         """Send a message to the configured chat, swallowing API/network
-        errors so a Telegram outage never crashes the trading loop."""
+        errors (and enforcing a hard timeout) so a Telegram outage or hang
+        never crashes — or blocks — the trading loop."""
         if not self.enabled:
             logger.debug("Telegram send skipped (disabled): %s", text.replace("\n", " | "))
             return
 
         assert self.bot is not None
         try:
-            await self.bot.send_message(chat_id=self.chat_id, text=text)
+            await asyncio.wait_for(
+                self.bot.send_message(chat_id=self.chat_id, text=text),
+                timeout=self.SEND_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Telegram send timed out after %.0fs — giving up on this message "
+                "rather than hanging indefinitely.", self.SEND_TIMEOUT_SECONDS,
+            )
         except (TelegramAPIError, TelegramNetworkError) as exc:
             logger.warning("Failed to send Telegram message: %s", exc)
         except Exception as exc:  # noqa: BLE001 - defensive catch-all

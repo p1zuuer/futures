@@ -220,6 +220,7 @@ class Settings:
 
     # --- Trading mode -------------------------------------------------
     dydx_v4_live_trading_enabled: bool
+    paper_balance: float
 
     # --- dYdX v4 credentials / endpoints --------------------------------
     dydx_v4_mnemonic: str
@@ -250,6 +251,17 @@ class Settings:
     strategy_adx_threshold: float       # trend_pullback only
     strategy_use_adx_filter: bool       # trend_pullback only
     strategy_tp_atr_multiplier: Optional[float]  # trend_pullback only; None = use risk_reward_ratio
+    # trend_pullback only: dynamic ATR-based SL/TP (separate multipliers
+    # instead of one shared atr_multiplier + risk_reward_ratio) and volume
+    # spike confirmation (require volume >= vol_ma * threshold on the
+    # pullback-confirmation candle, to filter out fake pullbacks that
+    # happen on thin/low-conviction volume).
+    strategy_atr_multiplier_sl: float
+    strategy_atr_multiplier_tp: float
+    strategy_use_dynamic_atr_stops: bool
+    strategy_volume_ma_period: int
+    strategy_volume_spike_threshold: float
+    strategy_use_volume_confirmation: bool
     risk_max_daily_loss_pct: float
     risk_max_position_leverage: float
     risk_per_trade_pct: float
@@ -279,7 +291,17 @@ class Settings:
 
     @staticmethod
     def load() -> "Settings":
+        # DYDX_V4_LIVE_TRADING_ENABLED remains the primary flag (matches
+        # the rest of the dYdX-specific naming in this file), but
+        # PAPER_TRADING is also accepted as a more intuitive, explicitly
+        # requested alias — PAPER_TRADING=true forces paper mode
+        # regardless of DYDX_V4_LIVE_TRADING_ENABLED; PAPER_TRADING=false
+        # is equivalent to DYDX_V4_LIVE_TRADING_ENABLED=true. If PAPER_TRADING
+        # is not set at all, DYDX_V4_LIVE_TRADING_ENABLED alone decides.
         live_trading_enabled = parse_bool_env("DYDX_V4_LIVE_TRADING_ENABLED", default=False)
+        if os.environ.get("PAPER_TRADING", "").strip():
+            paper_trading = parse_bool_env("PAPER_TRADING", default=True)
+            live_trading_enabled = not paper_trading
         mnemonic = _get_str("DYDX_V4_MNEMONIC")
 
         # Normalize/validate the Indexer URL once, centrally, so every
@@ -303,6 +325,13 @@ class Settings:
 
         settings = Settings(
             dydx_v4_live_trading_enabled=live_trading_enabled,
+            # PAPER_BALANCE: starting/simulated balance for PaperExchange.
+            # Previously this was hardcoded to 15.0 in main.py's entrypoint
+            # with no environment override at all — a real gap for a
+            # deployment target (Render) that configures everything via
+            # env vars. Also accepts the older PAPER_TRADING_BALANCE name
+            # for backward compatibility with any existing deployment.
+            paper_balance=_get_float("PAPER_BALANCE", _get_float("PAPER_TRADING_BALANCE", 15.0)),
             dydx_v4_mnemonic=mnemonic,
             dydx_v4_node_url=_get_str("DYDX_V4_NODE_URL"),
             dydx_v4_indexer_url=indexer_url,
@@ -354,6 +383,18 @@ class Settings:
                 _get_float("STRATEGY_TP_ATR_MULTIPLIER", 0.0)
                 if os.environ.get("STRATEGY_TP_ATR_MULTIPLIER", "").strip() else None
             ),
+            # trend_pullback: dynamic (separate SL/TP) ATR multipliers and
+            # volume-spike confirmation. Previously these were added directly
+            # to strategies/trend_pullback.py's constructor defaults but
+            # never wired through config.py/main.py — meaning they were NOT
+            # actually configurable via environment variables at all, only
+            # by editing the strategy file's hardcoded defaults directly.
+            strategy_atr_multiplier_sl=_get_float("STRATEGY_ATR_MULTIPLIER_SL", 1.5),
+            strategy_atr_multiplier_tp=_get_float("STRATEGY_ATR_MULTIPLIER_TP", 2.5),
+            strategy_use_dynamic_atr_stops=parse_bool_env("STRATEGY_USE_DYNAMIC_ATR_STOPS", default=True),
+            strategy_volume_ma_period=_get_int("STRATEGY_VOLUME_MA_PERIOD", 20),
+            strategy_volume_spike_threshold=_get_float("STRATEGY_VOLUME_SPIKE_THRESHOLD", 1.1),
+            strategy_use_volume_confirmation=parse_bool_env("STRATEGY_USE_VOLUME_CONFIRMATION", default=True),
             # Daily max drawdown (% of the day's starting equity) before
             # the RiskManager circuit breaker blocks all new orders until
             # the next UTC day.
@@ -363,7 +404,10 @@ class Settings:
             # config override at all — a real gap for anyone wanting a
             # different leverage (e.g. 3x) without editing source.
             risk_max_position_leverage=_get_float("RISK_MAX_POSITION_LEVERAGE", 2.0),
-            risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", 1.0),
+            # RISK_PER_TRADE (explicitly requested name) takes priority if
+            # set; RISK_PER_TRADE_PCT is the original/legacy name and
+            # remains supported for backward compatibility.
+            risk_per_trade_pct=_get_float("RISK_PER_TRADE", _get_float("RISK_PER_TRADE_PCT", 1.0)),
             # Candle resolution for live trading + calibration. 1-minute
             # EMA crossovers proved too noisy/fee-heavy in backtesting;
             # default is now 5-minute candles.
@@ -471,6 +515,14 @@ class Settings:
             raise ConfigError("STRATEGY_ADX_THRESHOLD must be non-negative.")
         if self.strategy_tp_atr_multiplier is not None and self.strategy_tp_atr_multiplier <= 0:
             raise ConfigError("STRATEGY_TP_ATR_MULTIPLIER must be positive when set.")
+        if self.strategy_atr_multiplier_sl <= 0 or self.strategy_atr_multiplier_tp <= 0:
+            raise ConfigError("STRATEGY_ATR_MULTIPLIER_SL and STRATEGY_ATR_MULTIPLIER_TP must be positive.")
+        if self.strategy_volume_ma_period <= 0:
+            raise ConfigError("STRATEGY_VOLUME_MA_PERIOD must be positive.")
+        if self.strategy_volume_spike_threshold <= 0:
+            raise ConfigError("STRATEGY_VOLUME_SPIKE_THRESHOLD must be positive.")
+        if self.paper_balance <= 0:
+            raise ConfigError("PAPER_BALANCE must be positive.")
 
     def summary(self) -> str:
         """Human-readable, secret-redacted summary for startup logs."""
@@ -484,6 +536,7 @@ class Settings:
         )
         return (
             f"mode={'LIVE' if self.dydx_v4_live_trading_enabled else 'PAPER'} "
+            f"| paper_balance=${self.paper_balance:.2f} "
             f"| tickers={','.join(self.tickers)} "
             f"| mnemonic={mnemonic_status} "
             f"| node_url={self.dydx_v4_node_url or '(unset)'} "

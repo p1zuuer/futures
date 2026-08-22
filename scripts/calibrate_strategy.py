@@ -482,7 +482,7 @@ def _analyze_pullback_at(
     last_closed = indicators.iloc[i - 1]
     prev_closed = indicators.iloc[i - 2]
 
-    required_fields = ["ema_trend", "ema_pullback", "rsi", "atr", "adx"]
+    required_fields = ["ema_trend", "ema_pullback", "rsi", "atr", "adx", "vol_ma"]
     if last_closed[required_fields].isna().any() or prev_closed[required_fields].isna().any():
         return None
 
@@ -493,12 +493,14 @@ def _analyze_pullback_at(
     close_prev = float(prev_closed["close"])
     rsi_prev = float(prev_closed["rsi"])
     adx_now = float(last_closed["adx"])
+    volume_now = float(last_closed["volume"])
+    vol_ma_now = float(last_closed["vol_ma"])
 
     macro_uptrend = close_now > ema_trend_now
     macro_downtrend = close_now < ema_trend_now
 
-    pulled_back_to_ema = close_prev <= ema_pullback_prev
-    pulled_back_from_ema = close_prev >= ema_pullback_prev
+    pulled_back_to_ema = close_prev <= ema_pullback_prev * 1.002
+    pulled_back_from_ema = close_prev >= ema_pullback_prev * 0.998
     closed_back_above_ema = close_now > ema_pullback_now
     closed_back_below_ema = close_now < ema_pullback_now
 
@@ -508,6 +510,18 @@ def _analyze_pullback_at(
     if strategy.use_rsi_confirmation:
         long_setup = long_setup and (rsi_prev <= strategy.rsi_oversold)
         short_setup = short_setup and (rsi_prev >= strategy.rsi_overbought)
+
+    # Volume-spike confirmation — mirrors TrendPullbackStrategy.analyze()
+    # exactly, including the fail-safe "suppress rather than silently
+    # bypass" behavior when vol_ma is unusable (<= 0).
+    if strategy.use_volume_confirmation:
+        if vol_ma_now > 0:
+            volume_ok = volume_now >= (vol_ma_now * strategy.volume_spike_threshold)
+            long_setup = long_setup and volume_ok
+            short_setup = short_setup and volume_ok
+        elif long_setup or short_setup:
+            long_setup = False
+            short_setup = False
 
     if long_setup:
         raw_side = "BUY"
@@ -538,12 +552,21 @@ def _analyze_pullback_at(
         reason = "cooldown_active"
         side = "HOLD"
 
-    sl_distance = atr_value * strategy.atr_multiplier_sl
-    tp_distance = (
-        atr_value * strategy.tp_atr_multiplier
-        if strategy.tp_atr_multiplier is not None
-        else sl_distance * strategy.risk_reward_ratio
-    )
+    # ATR-based SL/TP — mirrors TrendPullbackStrategy.analyze() exactly:
+    # dynamic (separate SL/TP multiplier) stops take priority when
+    # enabled; tp_atr_multiplier (if set) overrides the TP distance on
+    # top of that; otherwise falls back to the legacy
+    # SL(1.5xATR)/risk_reward_ratio behavior.
+    if strategy.use_dynamic_atr_stops:
+        sl_distance = atr_value * strategy.atr_multiplier_sl
+        tp_distance = atr_value * strategy.atr_multiplier_tp
+    else:
+        sl_distance = atr_value * 1.5
+        tp_distance = sl_distance * strategy.risk_reward_ratio
+
+    if strategy.tp_atr_multiplier is not None:
+        tp_distance = atr_value * strategy.tp_atr_multiplier
+
     if side == "BUY":
         stop_loss = entry_price - sl_distance
         take_profit = entry_price + tp_distance
@@ -567,18 +590,23 @@ def run_backtest_pullback(
     ema_trend: int = 200,
     ema_pullback: int = 20,
     rsi_period: int = 14,
-    rsi_oversold: float = 40.0,
-    rsi_overbought: float = 60.0,
+    rsi_oversold: float = 45.0,
+    rsi_overbought: float = 55.0,
     use_rsi_confirmation: bool = True,
-    min_atr_pct: float = 0.12,
-    cooldown_candles: int = 8,
+    min_atr_pct: float = 0.08,
+    cooldown_candles: int = 5,
     atr_period: int = 14,
-    atr_multiplier: float = 1.5,
+    atr_multiplier_sl: float = 1.5,
+    atr_multiplier_tp: float = 2.5,
+    use_dynamic_atr_stops: bool = True,
     risk_reward_ratio: float = 2.0,
     tp_atr_multiplier: Optional[float] = None,
     adx_period: int = 14,
-    adx_threshold: float = 20.0,
+    adx_threshold: float = 18.0,
     use_adx_filter: bool = True,
+    volume_ma_period: int = 20,
+    volume_spike_threshold: float = 1.1,
+    use_volume_confirmation: bool = True,
 ) -> Tuple[List[TradeResult], SignalFunnel, TrendPullbackStrategy]:
     """
     Walk-forward, single-position backtest for `TrendPullbackStrategy`,
@@ -586,6 +614,14 @@ def run_backtest_pullback(
     fee-inclusive simulation mechanics as `run_backtest()` for the EMA
     crossover strategy — the only difference is which strategy's signal
     logic drives entries.
+
+    Defaults here are kept in sync with
+    `strategies/trend_pullback.py::TrendPullbackStrategy.__init__` —
+    including the dynamic (separate SL/TP) ATR multipliers and volume-spike
+    confirmation added after the original ADX/TP-multiplier calibration
+    work. If you change a default in the strategy file, update it here too,
+    or `--optimize`/`--multi` will silently backtest a DIFFERENT set of
+    rules than what actually trades live/paper.
     """
     strategy_logger = logging.getLogger("trend_pullback_strategy")
     original_level = strategy_logger.level
@@ -599,13 +635,17 @@ def run_backtest_pullback(
         rsi_overbought=rsi_overbought,
         use_rsi_confirmation=use_rsi_confirmation,
         atr_period=atr_period,
-        atr_multiplier_sl=atr_multiplier,
-        atr_multiplier_tp=atr_multiplier * risk_reward_ratio if tp_atr_multiplier is None else tp_atr_multiplier,
+        atr_multiplier_sl=atr_multiplier_sl,
+        atr_multiplier_tp=atr_multiplier_tp,
+        use_dynamic_atr_stops=use_dynamic_atr_stops,
         risk_reward_ratio=risk_reward_ratio,
         tp_atr_multiplier=tp_atr_multiplier,
         adx_period=adx_period,
         adx_threshold=adx_threshold,
         use_adx_filter=use_adx_filter,
+        volume_ma_period=volume_ma_period,
+        volume_spike_threshold=volume_spike_threshold,
+        use_volume_confirmation=use_volume_confirmation,
         cooldown_candles=cooldown_candles,
         min_atr_pct=min_atr_pct,
     )
@@ -616,7 +656,7 @@ def run_backtest_pullback(
     trades: List[TradeResult] = []
     position: Optional[dict] = None
     fee_frac = TAKER_FEE_PCT / 100.0
-    min_start = max(ema_trend, rsi_period, atr_period, adx_period * 2) + 5
+    min_start = max(ema_trend, rsi_period, atr_period, adx_period * 2, volume_ma_period) + 5
 
     for i in range(min_start, len(df)):
         current_candle = df.iloc[i]
@@ -1224,7 +1264,7 @@ def print_multi_asset_report(
     ema_trend: int, ema_pullback: int,
 ) -> None:
     print("\n" + "=" * 78)
-    print(f"PER-ASSET RESULTS - trend_pullback @ {resolution}, ema_trend={ema_trend}, "
+    print(f"PER-ASSET RESULTS — trend_pullback @ {resolution}, ema_trend={ema_trend}, "
           f"ema_pullback={ema_pullback}, ~{days:.0f} days")
     print("=" * 78)
 
@@ -1513,7 +1553,16 @@ async def main() -> None:
             use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
             min_atr_pct=settings.strategy_min_atr_pct,
             cooldown_candles=settings.strategy_cooldown_candles,
-            atr_multiplier=getattr(settings, "strategy_atr_multiplier", 1.5),
+            atr_multiplier_sl=settings.strategy_atr_multiplier_sl,
+            atr_multiplier_tp=settings.strategy_atr_multiplier_tp,
+            use_dynamic_atr_stops=settings.strategy_use_dynamic_atr_stops,
+            tp_atr_multiplier=settings.strategy_tp_atr_multiplier,
+            adx_period=settings.strategy_adx_period,
+            adx_threshold=settings.strategy_adx_threshold,
+            use_adx_filter=settings.strategy_use_adx_filter,
+            volume_ma_period=settings.strategy_volume_ma_period,
+            volume_spike_threshold=settings.strategy_volume_spike_threshold,
+            use_volume_confirmation=settings.strategy_use_volume_confirmation,
         )
         pullback_perf = compute_performance(trades_pb)
         print_funnel_report(funnel_pb, label="TREND-PULLBACK (new)")
