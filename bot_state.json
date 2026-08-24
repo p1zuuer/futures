@@ -1,22 +1,20 @@
 {
-  "schema_version": 1,
-  "saved_at": null,
   "symbols": [
-    "NEAR-USD"
+    "BTC-USD",
+    "ETH-USD"
   ],
   "cooldowns": {},
   "daily_risk": {
-    "current_day": null,
-    "daily_starting_equity": null,
-    "daily_realized_pnl_usd": 0.0,
+    "date": "",
+    "starting_equity": 0.0,
+    "realized_pnl_today": 0.0,
+    "daily_drawdown_pct": 0.0,
     "kill_switch_active": false
   },
   "open_conditional_orders": {},
   "paper_account": {
     "balance_usd": 15.0,
-    "equity_usd": 15.0,
-    "open_positions": {},
-    "pending_orders": {},
-    "last_prices": {}
+    "positions": {},
+    "orders": {}
   }
 }

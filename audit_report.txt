@@ -1,0 +1,69 @@
+================================================================================
+FINAL AUDIT BACKTEST & PAPER TRADING REPORT FOR CLOUD
+Generated at: 2026-08-23T05:20:00Z
+================================================================================
+
+1. EXTENDED SAMPLE NEAR-USD BACKTEST (90 Days, 1HOUR Resolution)
+--------------------------------------------------------------------------------
+Window: 2026-05-25 to 2026-08-23 (2,160 candles, ~90 days)
+Strategy: Trend-EMA Baseline vs Trend-Pullback
+
+- Trend-EMA Baseline (fast=9, slow=21):
+  * Total Trades: 78
+  * Win Rate:     47.44% (37 W / 41 L)
+  * Profit Factor: 1.780
+  * Max Drawdown:  4.286%
+  * Total Return: +33.670% (1x notional, fees included)
+
+- Trend-Pullback (ema_trend=200, ema_pullback=20):
+  * Total Trades: 10
+  * Win Rate:     60.00% (6 W / 4 L)
+  * Profit Factor: 1.927
+  * Max Drawdown:  1.598%
+  * Total Return:  +2.677% (1x notional, fees included)
+
+
+2. OUT-OF-SAMPLE (OOS) SPLIT / WALK-FORWARD BY NEAR-USD
+--------------------------------------------------------------------------------
+Methodology: First half (In-Sample, Days 1-45) parameter calibration vs Second half (Out-of-Sample, Days 46-90) validation.
+Parameters tuned on IS (EMA 9/21, Min ATR% = 0.5112):
+- In-Sample Results (Days 1-45):
+  * Total Trades: 18
+  * Win Rate:     55.56%
+  * Profit Factor: 2.140
+  * Max Drawdown:  2.129%
+- Out-of-Sample Results (Days 46-90, exact same parameters):
+  * Total Trades: 17
+  * Win Rate:     47.06%
+  * Profit Factor: 1.482
+  * Max Drawdown:  3.120%
+
+
+3. ADDITIONAL ASSETS (60-Day Multi-Asset Portfolio @ 1HOUR)
+--------------------------------------------------------------------------------
+Evaluated via Trend-Pullback strategy across 1,440 candles per asset:
+
+| Asset    | Candles | Trades | WinRate (%) | Profit Factor | Max Drawdown (%) |
+|----------|---------|--------|-------------|---------------|------------------|
+| NEAR-USD | 1440    | 8      | 62.50%      | 1.989         | 1.598%           |
+| AVAX-USD | 1440    | 10     | 30.00%      | 0.467         | 2.851%           |
+| LINK-USD | 1440    | 6      | 16.67%      | 0.207         | 1.727%           |
+
+Consolidated Portfolio Summary (Equal 1/3 capital sleeves, chronological pooling):
+- Total Trades:        24
+- Overall Win Rate:    37.50%
+- Portfolio PF:        0.781
+- Combined Max DD:     1.541%
+- Aggregate Return:    -0.631%
+
+
+4. CURRENT PAPER TRADING STATE (from bot_state.json)
+--------------------------------------------------------------------------------
+- Launch / Saved At:  2026-08-18T18:07:42+00:00
+- Active Symbols:     BTC-USD, ETH-USD, SOL-USD
+- Account Balance:    $15.00 USD
+- Current Equity:     $15.00 USD
+- Open Positions:     None (0 positions)
+- Cooldowns:          None active
+- Daily Risk Status:  Realized PnL $0.0, Kill-switch inactive
+================================================================================

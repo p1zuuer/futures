@@ -237,7 +237,7 @@ class Settings:
     # --- Strategy selection + risk controls -------------------------------
     # See strategies/trend_ema.py, strategies/trend_pullback.py, and
     # risk/manager.py for full semantics.
-    strategy_type: str  # "trend_pullback" (default) or "trend_ema" (legacy)
+    strategy_type: str  # "volatility_expansion", "trend_pullback", or "trend_ema"
     strategy_cooldown_candles: int
     strategy_min_atr_pct: float
     strategy_confirmation_candles: int  # trend_ema only
@@ -247,10 +247,23 @@ class Settings:
     strategy_rsi_oversold: float        # trend_pullback only
     strategy_rsi_overbought: float      # trend_pullback only
     strategy_use_rsi_confirmation: bool # trend_pullback only
-    strategy_adx_period: int            # trend_pullback only
+    strategy_adx_period: int            # trend_pullback / volatility_expansion
     strategy_adx_threshold: float       # trend_pullback only
     strategy_use_adx_filter: bool       # trend_pullback only
     strategy_tp_atr_multiplier: Optional[float]  # trend_pullback only; None = use risk_reward_ratio
+    # volatility_expansion specific parameters
+    strategy_n_donchian: int
+    strategy_n_bb: int
+    strategy_bb_mult: float
+    strategy_n_percentile_lookback: int
+    strategy_compression_percentile_threshold: float
+    strategy_adx_min_for_entry: float
+    strategy_n_vol_ma: int
+    strategy_volume_confirm_mult: float
+    strategy_atr_period: int
+    strategy_atr_sl_mult: float
+    strategy_atr_tp_mult: float
+    strategy_max_hold_bars: int
     # trend_pullback only: dynamic ATR-based SL/TP (separate multipliers
     # instead of one shared atr_multiplier + risk_reward_ratio) and volume
     # spike confirmation (require volume >= vol_ma * threshold on the
@@ -358,7 +371,18 @@ class Settings:
             # trend_ema only: consecutive closed candles a crossover must
             # hold before it's treated as confirmed.
             strategy_confirmation_candles=_get_int("STRATEGY_CONFIRMATION_CANDLES", 2),
-            # trend_pullback only: macro trend filter period, short-term
+            strategy_n_donchian=_get_int("STRATEGY_N_DONCHIAN", 20),
+            strategy_n_bb=_get_int("STRATEGY_N_BB", 20),
+            strategy_bb_mult=_get_float("STRATEGY_BB_MULT", 2.0),
+            strategy_n_percentile_lookback=_get_int("STRATEGY_N_PERCENTILE_LOOKBACK", 100),
+            strategy_compression_percentile_threshold=_get_float("STRATEGY_COMPRESSION_PERCENTILE_THRESHOLD", 25.0),
+            strategy_adx_min_for_entry=_get_float("STRATEGY_ADX_MIN_FOR_ENTRY", 20.0),
+            strategy_n_vol_ma=_get_int("STRATEGY_N_VOL_MA", 20),
+            strategy_volume_confirm_mult=_get_float("STRATEGY_VOLUME_CONFIRM_MULT", 1.2),
+            strategy_atr_period=_get_int("STRATEGY_ATR_PERIOD", 14),
+            strategy_atr_sl_mult=_get_float("STRATEGY_ATR_SL_MULT", 1.5),
+            strategy_atr_tp_mult=_get_float("STRATEGY_ATR_TP_MULT", 3.0),
+            strategy_max_hold_bars=_get_int("STRATEGY_MAX_HOLD_BARS", 48),
             # pullback EMA period, RSI settings, and whether RSI dipping
             # into oversold/overbought is required to confirm a pullback
             # (vs. relying on the EMA cross alone).
@@ -495,7 +519,7 @@ class Settings:
         if not self.state_file_path.strip():
             raise ConfigError("STATE_FILE_PATH must not be empty.")
 
-        valid_strategy_types = {"trend_pullback", "trend_ema"}
+        valid_strategy_types = {"volatility_expansion", "trend_pullback", "trend_ema"}
         if self.strategy_type not in valid_strategy_types:
             raise ConfigError(
                 f"STRATEGY_TYPE={self.strategy_type!r} is invalid. "
@@ -532,7 +556,12 @@ class Settings:
             f"ema_trend={self.strategy_ema_trend}/ema_pullback={self.strategy_ema_pullback}/"
             f"rsi={self.strategy_rsi_period}"
             if self.strategy_type == "trend_pullback"
-            else f"confirmation_candles={self.strategy_confirmation_candles}"
+            else (
+                f"n_donchian={self.strategy_n_donchian}/n_bb={self.strategy_n_bb}/"
+                f"comp_thresh={self.strategy_compression_percentile_threshold}"
+                if self.strategy_type == "volatility_expansion"
+                else f"confirmation_candles={self.strategy_confirmation_candles}"
+            )
         )
         return (
             f"mode={'LIVE' if self.dydx_v4_live_trading_enabled else 'PAPER'} "

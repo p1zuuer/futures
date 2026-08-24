@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: futures-trading-bot
+    env: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /
+    envVars:
+      - key: STRATEGY_TYPE
+        value: volatility_expansion
+      - key: TICKERS
+        value: BTC-USD,ETH-USD
+      - key: PAPER_TRADING
+        value: "true"
+      - key: N_DONCHIAN
+        value: "20"
+      - key: N_BB
+        value: "20"
+      - key: BB_MULT
+        value: "2.0"
+      - key: N_PERCENTILE_LOOKBACK
+        value: "100"
+      - key: COMPRESSION_PERCENTILE_THRESHOLD
+        value: "25"
+      - key: ADX_PERIOD
+        value: "14"
+      - key: ADX_MIN_FOR_ENTRY
+        value: "20"
+      - key: N_VOL_MA
+        value: "20"
+      - key: VOLUME_CONFIRM_MULT
+        value: "1.2"
+      - key: ATR_PERIOD
+        value: "14"
+      - key: ATR_SL_MULT
+        value: "1.5"
+      - key: ATR_TP_MULT
+        value: "3.0"
+      - key: MAX_HOLD_BARS
+        value: "48"
+      - key: ENABLE_EARLY_EXIT_ON_FALSE_BREAKOUT
+        value: "false"
+      - key: RISK_PER_TRADE
+        value: "1.0"
+      - key: RISK_MAX_DAILY_LOSS_PCT
+        value: "5"
+      - key: DYDX_V4_LIVE_TRADING_ENABLED
+        value: "false"
+      - key: CANDLE_RESOLUTION
+        value: "1HOUR"
