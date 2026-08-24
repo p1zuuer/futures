@@ -76,6 +76,7 @@ from services.telegram_notifier import TelegramNotifier
 from state.persistence import BotStateStore
 from strategies.trend_ema import Signal, StrategyError, TrendEmaStrategy
 from strategies.trend_pullback import TrendPullbackStrategy
+from strategies.volatility_expansion import VolatilityExpansionStrategy
 
 logger = logging.getLogger("trading_bot")
 if not logger.handlers:
@@ -317,7 +318,25 @@ class TradingBot:
         # tickers, and the daily-loss circuit breaker in RiskManager is
         # intentionally portfolio-wide (shared across all symbols), not
         # per-symbol, since it's a single account's daily drawdown limit.
-        if settings.strategy_type == "trend_pullback":
+        if settings.strategy_type == "volatility_expansion":
+            self.strategy = VolatilityExpansionStrategy(
+                n_donchian=settings.strategy_n_donchian,
+                n_bb=settings.strategy_n_bb,
+                bb_mult=settings.strategy_bb_mult,
+                n_percentile_lookback=settings.strategy_n_percentile_lookback,
+                compression_percentile_threshold=settings.strategy_compression_percentile_threshold,
+                adx_period=settings.strategy_adx_period,
+                adx_min_for_entry=settings.strategy_adx_min_for_entry,
+                n_vol_ma=settings.strategy_n_vol_ma,
+                volume_confirm_mult=settings.strategy_volume_confirm_mult,
+                atr_period=settings.strategy_atr_period,
+                atr_sl_mult=settings.strategy_atr_sl_mult,
+                atr_tp_mult=settings.strategy_atr_tp_mult,
+                max_hold_bars=settings.strategy_max_hold_bars,
+                cooldown_candles=settings.strategy_cooldown_candles,
+                min_atr_pct=settings.strategy_min_atr_pct,
+            )
+        elif settings.strategy_type == "trend_pullback":
             self.strategy = TrendPullbackStrategy(
                 ema_trend=settings.strategy_ema_trend,
                 ema_pullback=settings.strategy_ema_pullback,
