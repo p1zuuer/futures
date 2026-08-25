@@ -282,7 +282,7 @@ class TelegramNotifier:
                 dd = r.get("daily_drawdown_pct", 0.0)
                 max_dd = r.get("max_daily_loss_pct", 5.0)
                 ks = r.get("kill_switch_active", False)
-                ks_emoji = "🛑 ACTIVE" | "✅ Normal" if ks else "✅ Normal"
+                ks_emoji = "🛑 ACTIVE" if ks else "✅ Normal"
                 return (
                     "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n\n"
                     f"📉 Daily Drawdown: <b>{dd:.2f}%</b> (Max: {max_dd:.1f}%)\n"
@@ -300,6 +300,8 @@ class TelegramNotifier:
             "⚖️ Risk per Trade: <b>1.0%</b>\n"
             "📐 Max Leverage: <b>5x</b>"
         )
+
+    async def _build_status_text(self) -> str:
         if self._status_callback is None:
             return "⚠️ Status is not available yet — the trading bot hasn't connected."
 
