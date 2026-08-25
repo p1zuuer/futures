@@ -948,6 +948,19 @@ class TradingBot:
         # /status command up to live account data before entering the loop.
         await self.notifier.start()
         self.notifier.set_status_callback(self.exchange.get_account_summary)
+        
+        async def _get_config_summary() -> dict:
+            return {
+                "mode": "LIVE" if self.live_trading_enabled else "PAPER",
+                "symbols": list(self.symbols),
+                "strategy": settings.strategy_type,
+                "candle_resolution": self.candle_resolution,
+            }
+        self.notifier.set_config_callback(_get_config_summary)
+
+        async def _get_risk_summary() -> dict:
+            return self.risk_manager.get_daily_stats()
+        self.notifier.set_risk_callback(_get_risk_summary)
 
         logger.info(
             "TradingBot starting | symbols=%s poll_interval=%.1fs",

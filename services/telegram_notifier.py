@@ -28,7 +28,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 logger = logging.getLogger("telegram_notifier")
 if not logger.handlers:
@@ -45,6 +45,8 @@ if not logger.handlers:
 # A status callback is any zero-arg async callable returning a dict shaped
 # like PaperExchange.get_account_summary()'s output. main.py injects this.
 StatusCallback = Callable[[], Awaitable[dict]]
+ConfigCallback = Callable[[], Awaitable[dict]]
+RiskCallback = Callable[[], Awaitable[dict]]
 
 
 class TelegramNotifier:
@@ -67,6 +69,8 @@ class TelegramNotifier:
         self.dispatcher: Optional[Dispatcher] = None
         self._polling_task: Optional[asyncio.Task] = None
         self._status_callback: Optional[StatusCallback] = None
+        self._config_callback: Optional[ConfigCallback] = None
+        self._risk_callback: Optional[RiskCallback] = None
 
         if self.enabled:
             self.bot = Bot(
@@ -105,12 +109,37 @@ class TelegramNotifier:
         """
         self._status_callback = callback
 
+    def set_config_callback(self, callback: ConfigCallback) -> None:
+        self._config_callback = callback
+
+    def set_risk_callback(self, callback: RiskCallback) -> None:
+        self._risk_callback = callback
+
+    def _get_menu_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🔄 Обновить", callback_data="menu_refresh"),
+                    InlineKeyboardButton(text="📊 PnL Stats", callback_data="menu_pnl"),
+                ],
+                [
+                    InlineKeyboardButton(text="⚙️ Конфиг", callback_data="menu_config"),
+                    InlineKeyboardButton(text="🛡 Риски", callback_data="menu_risk"),
+                ],
+            ]
+        )
+
     def _register_handlers(self) -> None:
         assert self.dispatcher is not None
 
         @self.dispatcher.message(CommandStart())
         async def _on_start(message: Message) -> None:
-            await self._safe_reply(message, self._welcome_text())
+            await self._safe_reply_with_menu(message, self._welcome_text())
+
+        @self.dispatcher.message(Command("menu"))
+        async def _on_menu(message: Message) -> None:
+            text = await self._build_status_text()
+            await self._safe_reply_with_menu(message, text)
 
         @self.dispatcher.message(Command("help"))
         async def _on_help(message: Message) -> None:
@@ -119,7 +148,34 @@ class TelegramNotifier:
         @self.dispatcher.message(Command("status"))
         async def _on_status(message: Message) -> None:
             text = await self._build_status_text()
-            await self._safe_reply(message, text)
+            await self._safe_reply_with_menu(message, text)
+
+        @self.dispatcher.callback_query(F.data.startswith("menu_"))
+        async def _on_menu_callback(callback: CallbackQuery) -> None:
+            data = callback.data
+            await callback.answer()
+            if not callback.message:
+                return
+
+            if data == "menu_refresh":
+                text = await self._build_status_text()
+            elif data == "menu_pnl":
+                text = await self._build_pnl_text()
+            elif data == "menu_config":
+                text = await self._build_config_text()
+            elif data == "menu_risk":
+                text = await self._build_risk_text()
+            else:
+                text = await self._build_status_text()
+
+            try:
+                await callback.message.edit_text(
+                    text=text,
+                    reply_markup=self._get_menu_keyboard(),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                logger.debug("Failed to edit message on callback: %s", exc)
 
         @self.dispatcher.message(F.text)
         async def _on_unknown(message: Message) -> None:
@@ -133,6 +189,15 @@ class TelegramNotifier:
             await message.answer(text)
         except (TelegramAPIError, TelegramNetworkError) as exc:
             logger.warning("Failed to reply to Telegram message: %s", exc)
+
+    async def _safe_reply_with_menu(self, message: Message, text: str) -> None:
+        try:
+            await message.answer(
+                text,
+                reply_markup=self._get_menu_keyboard(),
+            )
+        except (TelegramAPIError, TelegramNetworkError) as exc:
+            logger.warning("Failed to reply to Telegram message with menu: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Command text builders
@@ -160,7 +225,81 @@ class TelegramNotifier:
             "/help — show this help message"
         )
 
-    async def _build_status_text(self) -> str:
+    async def _build_pnl_text(self) -> str:
+        if self._status_callback is None:
+            return "⚠️ PnL stats not available yet — bot not connected."
+        try:
+            summary = await self._status_callback()
+        except Exception as exc:
+            logger.exception("PnL callback failed: %s", exc)
+            return "⚠️ Failed to fetch PnL stats."
+
+        balance = summary.get("balance_usd", 0.0)
+        equity = summary.get("equity_usd", 0.0)
+        pnl = equity - balance
+        pnl_pct = (pnl / balance * 100.0) if balance > 0 else 0.0
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+
+        lines = [
+            "📊 <b>PnL STATISTICS & BALANCE</b>",
+            "",
+            f"💰 Initial / Base: <b>${balance:.4f}</b>",
+            f"📈 Current Equity: <b>${equity:.4f}</b>",
+            f"{pnl_emoji} Total Return: <b>${pnl:+.4f} ({pnl_pct:+.2f}%)</b>",
+        ]
+        return "\n".join(lines)
+
+    async def _build_config_text(self) -> str:
+        if self._config_callback is not None:
+            try:
+                cfg = await self._config_callback()
+                mode = cfg.get("mode", "PAPER")
+                symbols = cfg.get("symbols", [])
+                strat = cfg.get("strategy", "trend_pullback")
+                res = cfg.get("candle_resolution", "5m")
+                return (
+                    "⚙️ <b>BOT CONFIGURATION</b>\n\n"
+                    f"🟢/🔴 Mode: <b>{mode}</b>\n"
+                    f"🏷 Symbols: <b>{', '.join(symbols)}</b>\n"
+                    f"📈 Strategy: <b>{strat}</b>\n"
+                    f"⏱ Resolution: <b>{res}</b>"
+                )
+            except Exception:
+                pass
+
+        return (
+            "⚙️ <b>BOT CONFIGURATION</b>\n\n"
+            "🟢/🔴 Mode: <b>PAPER</b> (default)\n"
+            "🏷 Symbols: <b>ETH-USD</b>\n"
+            "📈 Strategy: <b>trend_pullback</b>\n"
+            "⏱ Resolution: <b>5m</b>"
+        )
+
+    async def _build_risk_text(self) -> str:
+        if self._risk_callback is not None:
+            try:
+                r = await self._risk_callback()
+                dd = r.get("daily_drawdown_pct", 0.0)
+                max_dd = r.get("max_daily_loss_pct", 5.0)
+                ks = r.get("kill_switch_active", False)
+                ks_emoji = "🛑 ACTIVE" | "✅ Normal" if ks else "✅ Normal"
+                return (
+                    "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n\n"
+                    f"📉 Daily Drawdown: <b>{dd:.2f}%</b> (Max: {max_dd:.1f}%)\n"
+                    f"🚨 Kill-Switch: <b>{ks_emoji}</b>\n"
+                    f"⚖️ Risk per Trade: <b>1.0%</b>\n"
+                    f"📐 Max Leverage: <b>5x</b>"
+                )
+            except Exception:
+                pass
+
+        return (
+            "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n\n"
+            "📉 Daily Drawdown: <b>0.00%</b> (Max: 5.0%)\n"
+            "🚨 Kill-Switch: <b>✅ Normal</b>\n"
+            "⚖️ Risk per Trade: <b>1.0%</b>\n"
+            "📐 Max Leverage: <b>5x</b>"
+        )
         if self._status_callback is None:
             return "⚠️ Status is not available yet — the trading bot hasn't connected."
 
@@ -282,7 +421,7 @@ class TelegramNotifier:
     # and the background task completes rather than accumulating forever.
     SEND_TIMEOUT_SECONDS = 10.0
 
-    async def _send(self, text: str) -> None:
+    async def _send(self, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
         """Send a message to the configured chat, swallowing API/network
         errors (and enforcing a hard timeout) so a Telegram outage or hang
         never crashes — or blocks — the trading loop."""
@@ -293,7 +432,11 @@ class TelegramNotifier:
         assert self.bot is not None
         try:
             await asyncio.wait_for(
-                self.bot.send_message(chat_id=self.chat_id, text=text),
+                self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                ),
                 timeout=self.SEND_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
