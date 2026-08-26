@@ -224,6 +224,7 @@ class Settings:
 
     # --- dYdX v4 credentials / endpoints --------------------------------
     dydx_v4_mnemonic: str
+    dydx_v4_private_key: str
     dydx_v4_node_url: str
     dydx_v4_indexer_url: str
     dydx_v4_chain_id: str
@@ -316,6 +317,7 @@ class Settings:
             paper_trading = parse_bool_env("PAPER_TRADING", default=True)
             live_trading_enabled = not paper_trading
         mnemonic = _get_str("DYDX_V4_MNEMONIC")
+        private_key = _get_str("DYDX_V4_PRIVATE_KEY")
 
         # Normalize/validate the Indexer URL once, centrally, so every
         # consumer of `settings.dydx_v4_indexer_url` gets an already-strict
@@ -346,6 +348,7 @@ class Settings:
             # for backward compatibility with any existing deployment.
             paper_balance=_get_float("PAPER_BALANCE", _get_float("PAPER_TRADING_BALANCE", 15.0)),
             dydx_v4_mnemonic=mnemonic,
+            dydx_v4_private_key=private_key,
             dydx_v4_node_url=_get_str("DYDX_V4_NODE_URL"),
             dydx_v4_indexer_url=indexer_url,
             dydx_v4_chain_id=_get_str("DYDX_V4_CHAIN_ID", "dydx-mainnet-1"),
@@ -459,8 +462,8 @@ class Settings:
         """
         if self.dydx_v4_live_trading_enabled:
             missing = []
-            if not self.dydx_v4_mnemonic:
-                missing.append("DYDX_V4_MNEMONIC")
+            if not self.dydx_v4_mnemonic and not self.dydx_v4_private_key:
+                missing.append("DYDX_V4_MNEMONIC or DYDX_V4_PRIVATE_KEY")
             if not self.dydx_v4_node_url:
                 missing.append("DYDX_V4_NODE_URL")
             if not self.dydx_v4_indexer_url:
@@ -475,9 +478,9 @@ class Settings:
                     "and that these variables are set."
                 )
         else:
-            if self.dydx_v4_mnemonic:
+            if self.dydx_v4_mnemonic or self.dydx_v4_private_key:
                 logger.warning(
-                    "DYDX_V4_MNEMONIC is set but DYDX_V4_LIVE_TRADING_ENABLED "
+                    "DYDX_V4_MNEMONIC or DYDX_V4_PRIVATE_KEY is set but DYDX_V4_LIVE_TRADING_ENABLED "
                     "is false/unset — running in PAPER mode. If you intended "
                     "to trade live, set DYDX_V4_LIVE_TRADING_ENABLED=true."
                 )
@@ -550,7 +553,7 @@ class Settings:
 
     def summary(self) -> str:
         """Human-readable, secret-redacted summary for startup logs."""
-        mnemonic_status = "SET" if self.dydx_v4_mnemonic else "NOT SET"
+        mnemonic_status = "SET" if self.dydx_v4_mnemonic else ("SET (private key)" if self.dydx_v4_private_key else "NOT SET")
         telegram_status = "SET" if (self.telegram_bot_token and self.telegram_chat_id) else "NOT SET"
         strategy_detail = (
             f"ema_trend={self.strategy_ema_trend}/ema_pullback={self.strategy_ema_pullback}/"

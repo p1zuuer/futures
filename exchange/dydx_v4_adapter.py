@@ -198,6 +198,7 @@ class DydxV4Adapter(BaseExchange):
             from config import settings as _settings
 
             self.mnemonic: str = _settings.dydx_v4_mnemonic
+            self.private_key: str = _settings.dydx_v4_private_key
             self.node_url: str = _settings.dydx_v4_node_url
             self.indexer_url: str = normalize_and_validate_indexer_url(
                 _settings.dydx_v4_indexer_url, allow_non_mainnet
@@ -218,6 +219,7 @@ class DydxV4Adapter(BaseExchange):
                 "adapter alongside config.py for full .env support."
             )
             self.mnemonic = os.environ.get("DYDX_V4_MNEMONIC", "").strip()
+            self.private_key = os.environ.get("DYDX_V4_PRIVATE_KEY", "").strip()
             self.node_url = os.environ.get("DYDX_V4_NODE_URL", "").strip()
             self.indexer_url = normalize_and_validate_indexer_url(
                 os.environ.get("DYDX_V4_INDEXER_URL", "https://indexer.dydx.trade"),
@@ -277,9 +279,9 @@ class DydxV4Adapter(BaseExchange):
         cancel_order, close_position) will raise `NodeConnectionError`
         until a working Node connection is established.
         """
-        if not self.mnemonic:
+        if not self.mnemonic and not self.private_key:
             raise InvalidOrderError(
-                "DYDX_V4_MNEMONIC is not set — cannot derive a signing wallet."
+                "Neither DYDX_V4_MNEMONIC nor DYDX_V4_PRIVATE_KEY is set — cannot derive a signing wallet."
             )
 
         # --- Step 1: Indexer (REST/HTTP) — always attempted, always safe
@@ -372,10 +374,15 @@ class DydxV4Adapter(BaseExchange):
             )
             self._node = await NodeClient.connect(node_config)
 
-            key_pair = KeyPair.from_mnemonic(self.mnemonic)
-            address = Wallet(key=key_pair, account_number=0, sequence=0).address
-            self._wallet = await Wallet.from_mnemonic(self._node, self.mnemonic, address)
-            self._address = address
+            if self.private_key:
+                from dydx_v4_client.wallet import LocalWallet
+                self._wallet = await LocalWallet.from_private_key(self._node, self.private_key)
+                self._address = self._wallet.address
+            else:
+                key_pair = KeyPair.from_mnemonic(self.mnemonic)
+                address = Wallet(key=key_pair, account_number=0, sequence=0).address
+                self._wallet = await Wallet.from_mnemonic(self._node, self.mnemonic, address)
+                self._address = address
 
         await _with_retries(_do_connect_node, op_name="connect (node/gRPC)")
         self._node_connected = True
