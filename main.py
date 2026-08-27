@@ -77,6 +77,7 @@ from state.persistence import BotStateStore
 from strategies.trend_ema import Signal, StrategyError, TrendEmaStrategy
 from strategies.trend_pullback import TrendPullbackStrategy
 from strategies.volatility_expansion import VolatilityExpansionStrategy
+from strategies.regime_trend import RegimeTrendStrategy
 
 logger = logging.getLogger("trading_bot")
 if not logger.handlers:
@@ -335,6 +336,19 @@ class TradingBot:
                 max_hold_bars=settings.strategy_max_hold_bars,
                 cooldown_candles=settings.strategy_cooldown_candles,
                 min_atr_pct=settings.strategy_min_atr_pct,
+            )
+        elif settings.strategy_type == "regime_trend":
+            self.strategy = RegimeTrendStrategy(
+                ema_fast=20,
+                ema_slow=100,
+                adx_period=14,
+                adx_min=22.0,
+                adx_lookback_bars=5,
+                atr_period=14,
+                atr_sl_mult=1.5,
+                atr_tp_mult=3.0,
+                max_hold_bars=72,
+                cooldown_bars=6,
             )
         elif settings.strategy_type == "trend_pullback":
             self.strategy = TrendPullbackStrategy(

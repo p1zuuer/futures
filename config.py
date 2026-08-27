@@ -522,7 +522,7 @@ class Settings:
         if not self.state_file_path.strip():
             raise ConfigError("STATE_FILE_PATH must not be empty.")
 
-        valid_strategy_types = {"volatility_expansion", "trend_pullback", "trend_ema"}
+        valid_strategy_types = {"volatility_expansion", "trend_pullback", "trend_ema", "regime_trend"}
         if self.strategy_type not in valid_strategy_types:
             raise ConfigError(
                 f"STRATEGY_TYPE={self.strategy_type!r} is invalid. "

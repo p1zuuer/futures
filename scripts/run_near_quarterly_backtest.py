@@ -53,7 +53,7 @@ async def main():
         quarters.append((f"Q{i+1} ({q_start.strftime('%Y-%m-%d')} to {q_end.strftime('%Y-%m-%d')})", q_df))
 
     print("\n" + "=" * 80)
-    print(f"QUARTERLY WALK-FORWARD BACKTEST: trend_pullback on {symbol} (365 days, 1HOUR)")
+    print(f"QUARTERLY WALK-FORWARD BACKTEST: trend_ema on {symbol} (365 days, 1HOUR)")
     print("=" * 80)
 
     all_trades = []
@@ -64,30 +64,20 @@ async def main():
             print(f"Insufficient candles ({len(q_df)}) for backtest.")
             continue
 
-        trades_pb, funnel_pb, _ = run_backtest_pullback(
+        trades_ema, _ = run_backtest_ema(
             q_df, symbol,
-            ema_trend=settings.strategy_ema_trend,
-            ema_pullback=settings.strategy_ema_pullback,
-            rsi_period=settings.strategy_rsi_period,
-            rsi_oversold=settings.strategy_rsi_oversold,
-            rsi_overbought=settings.strategy_rsi_overbought,
-            use_rsi_confirmation=settings.strategy_use_rsi_confirmation,
-            min_atr_pct=settings.strategy_min_atr_pct,
+            fast_ema=settings.strategy_fast_ema,
+            slow_ema=settings.strategy_slow_ema,
+            atr_period=settings.strategy_atr_period,
+            atr_multiplier=settings.strategy_atr_multiplier,
+            risk_reward_ratio=settings.strategy_risk_reward_ratio,
             cooldown_candles=settings.strategy_cooldown_candles,
-            atr_multiplier_sl=settings.strategy_atr_multiplier_sl,
-            atr_multiplier_tp=settings.strategy_atr_multiplier_tp,
-            use_dynamic_atr_stops=settings.strategy_use_dynamic_atr_stops,
-            tp_atr_multiplier=settings.strategy_tp_atr_multiplier,
-            adx_period=settings.strategy_adx_period,
-            adx_threshold=settings.strategy_adx_threshold,
-            use_adx_filter=settings.strategy_use_adx_filter,
-            volume_ma_period=settings.strategy_volume_ma_period,
-            volume_spike_threshold=settings.strategy_volume_spike_threshold,
-            use_volume_confirmation=settings.strategy_use_volume_confirmation,
+            min_atr_pct=settings.strategy_min_atr_pct,
+            confirmation_candles=settings.strategy_confirmation_candles,
         )
 
-        perf = compute_performance(trades_pb)
-        all_trades.extend(trades_pb)
+        perf = compute_performance(trades_ema)
+        all_trades.extend(trades_ema)
 
         pf_str = f"{perf.profit_factor:.3f}" if perf.profit_factor is not None else "n/a"
         if pf_str == "inf":
@@ -98,8 +88,18 @@ async def main():
         print(f"Total Trades     : {perf.total_trades}")
         print(f"Win Rate         : {perf.win_rate_pct:.2f}% ({perf.wins}W / {perf.losses}L)")
         print(f"Profit Factor    : {pf_str}")
-        print(f"Max Drawdown     : {perf.max_drawdown_pct:.3f}%")
-        print(f"Total Return     : {perf.total_return_pct:+.3f}%")
+        print(f"Total Return     : {perf.total_return_pct:+.2f}%")
+        print(f"Max Drawdown     : {perf.max_drawdown_pct:.2f}%")
+
+    overall_perf = compute_performance(all_trades)
+    print("\n" + "=" * 80)
+    print(f"OVERALL 365-DAY PERFORMANCE (trend_ema on {symbol})")
+    print("=" * 80)
+    print(f"Total Trades     : {overall_perf.total_trades}")
+    print(f"Win Rate         : {overall_perf.win_rate_pct:.2f}%")
+    print(f"Profit Factor    : {overall_perf.profit_factor:.3f}")
+    print(f"Total Return     : {overall_perf.total_return_pct:+.2f}%")
+    print(f"Max Drawdown     : {overall_perf.max_drawdown_pct:.2f}%")
 
     # Overall full year summary
     overall_perf = compute_performance(all_trades)
