@@ -7,7 +7,7 @@ services:
     healthCheckPath: /
     envVars:
       - key: STRATEGY_TYPE
-        value: volatility_expansion
+        value: regime_trend
       - key: TICKERS
         value: BTC-USD,ETH-USD
       - key: PAPER_TRADING

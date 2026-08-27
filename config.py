@@ -364,7 +364,7 @@ class Settings:
             # the default — 1m/5m raw EMA crossovers backtested with too
             # much noise/fee drag for positive expectancy. "trend_ema" is
             # kept available as the legacy option.
-            strategy_type=_get_str("STRATEGY_TYPE", "trend_pullback").strip().lower(),
+            strategy_type=_get_str("STRATEGY_TYPE", "regime_trend").strip().lower(),
             # Post-stop-out cooldown, in candles, before a same-direction
             # signal is allowed again for a symbol.
             strategy_cooldown_candles=_get_int("STRATEGY_COOLDOWN_CANDLES", 8),
@@ -443,7 +443,7 @@ class Settings:
             # Deduplicated, uppercased, order-preserving. Defaults to a
             # single symbol for backward compatibility with existing
             # single-asset deployments.
-            tickers=_parse_tickers(_get_str("TICKERS", "ETH-USD")),
+            tickers=_parse_tickers(_get_str("TICKERS", "BTC-USD,ETH-USD")),
             state_file_path=_get_str("STATE_FILE_PATH", "bot_state.json"),
             state_persistence_enabled=parse_bool_env("STATE_PERSISTENCE_ENABLED", default=True),
             log_level=_get_str("LOG_LEVEL", "INFO").upper(),
