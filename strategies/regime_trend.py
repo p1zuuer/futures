@@ -30,6 +30,18 @@ SignalSide = Literal["BUY", "SELL", "HOLD"]
 REQUIRED_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume")
 
 
+class StrategyError(Exception):
+    """Base exception for strategy-level errors."""
+
+
+class InsufficientDataError(StrategyError):
+    """Raised when the input DataFrame does not have enough rows to analyze."""
+
+
+class InvalidDataFrameError(StrategyError):
+    """Raised when the input DataFrame is missing required OHLCV columns."""
+
+
 @dataclass
 class RegimeSignal:
     symbol: str
@@ -110,6 +122,15 @@ class RegimeTrendStrategy:
         df["adx"] = dx.ewm(alpha=1/self.adx_period, adjust=False).mean()
 
         return df
+
+    def _validate_columns(self, df: pd.DataFrame) -> None:
+        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            raise InvalidDataFrameError(f"DataFrame is missing required columns: {missing}")
+
+    def analyze(self, symbol: str, df: pd.DataFrame) -> RegimeSignal:
+        self._validate_columns(df)
+        return self.generate_signal(df, symbol)
 
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> RegimeSignal:
         if len(df) < max(self.ema_slow, self.adx_period * 2, self.atr_period) + 10:
