@@ -280,6 +280,14 @@ class Settings:
     risk_max_position_leverage: float
     risk_per_trade_pct: float
 
+    # --- Kill Switch --------------------------------------------------------
+    kill_max_daily_loss_pct: float
+    kill_max_consecutive_losses: int
+    kill_max_position_notional_pct: float
+    kill_max_slippage_pct: float
+    kill_max_orders_per_hour: int
+    kill_heartbeat_timeout_sec: float
+
     # --- Market data -------------------------------------------------------
     # Candle resolution used for both live trading and calibration. Must be
     # one of dYdX v4's supported values: "1MIN", "5MINS", "15MINS",
@@ -435,6 +443,12 @@ class Settings:
             # set; RISK_PER_TRADE_PCT is the original/legacy name and
             # remains supported for backward compatibility.
             risk_per_trade_pct=_get_float("RISK_PER_TRADE", _get_float("RISK_PER_TRADE_PCT", 1.0)),
+            kill_max_daily_loss_pct=_get_float("KILL_MAX_DAILY_LOSS_PCT", 10.0),
+            kill_max_consecutive_losses=_get_int("KILL_MAX_CONSECUTIVE_LOSSES", 3),
+            kill_max_position_notional_pct=_get_float("KILL_MAX_POSITION_NOTIONAL_PCT", 50.0),
+            kill_max_slippage_pct=_get_float("KILL_MAX_SLIPPAGE_PCT", 1.5),
+            kill_max_orders_per_hour=_get_int("KILL_MAX_ORDERS_PER_HOUR", 30),
+            kill_heartbeat_timeout_sec=_get_float("KILL_HEARTBEAT_TIMEOUT_SEC", 300.0),
             # Candle resolution for live trading + calibration. 1-minute
             # EMA crossovers proved too noisy/fee-heavy in backtesting;
             # default is now 5-minute candles.
@@ -509,6 +523,12 @@ class Settings:
             )
         if not (0 < self.risk_per_trade_pct <= 100):
             raise ConfigError("RISK_PER_TRADE_PCT must be within (0, 100].")
+
+        if self.kill_max_daily_loss_pct >= self.risk_max_daily_loss_pct:
+            raise ConfigError(
+                f"KILL_MAX_DAILY_LOSS_PCT ({self.kill_max_daily_loss_pct}) must be strictly less than "
+                f"RISK_MAX_DAILY_LOSS_PCT ({self.risk_max_daily_loss_pct}) to ensure the kill-switch triggers before or alongside daily risk limits."
+            )
 
         if not self.tickers:
             raise ConfigError("TICKERS produced an empty list — at least one symbol is required.")

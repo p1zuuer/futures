@@ -1,4 +1,10 @@
 {
+  "schema_version": 1,
+  "saved_at": "2026-08-27T10:48:00Z",
+  "kill_switch_active": false,
+  "kill_switch_reason": null,
+  "kill_switch_triggered_at": null,
+  "last_pulse_timestamp": "2026-08-27T10:48:00Z",
   "symbols": [
     "BTC-USD",
     "ETH-USD"
@@ -8,8 +14,7 @@
     "date": "",
     "starting_equity": 0.0,
     "realized_pnl_today": 0.0,
-    "daily_drawdown_pct": 0.0,
-    "kill_switch_active": false
+    "daily_drawdown_pct": 0.0
   },
   "open_conditional_orders": {},
   "paper_account": {
