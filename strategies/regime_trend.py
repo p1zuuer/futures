@@ -90,6 +90,25 @@ class RegimeTrendStrategy:
         self.atr_tp_mult = atr_tp_mult
         self.max_hold_bars = max_hold_bars
         self.cooldown_bars = cooldown_bars
+        self._last_stop_out: Dict[str, Dict[str, pd.Timestamp]] = {}
+
+    def get_cooldown_state(self) -> dict:
+        return {
+            symbol: {side: ts.isoformat() for side, ts in sides.items()}
+            for symbol, sides in self._last_stop_out.items()
+        }
+
+    def load_cooldown_state(self, state: dict) -> None:
+        restored: Dict[str, Dict[str, pd.Timestamp]] = {}
+        try:
+            for symbol, sides in state.items():
+                restored[symbol] = {
+                    side: pd.Timestamp(ts) for side, ts in sides.items()
+                }
+            self._last_stop_out = restored
+            logger.info("Cooldown state restored | %d active cooldown(s)", len(restored))
+        except (AttributeError, ValueError, TypeError) as exc:
+            logger.error("Failed to restore cooldown state (%s)", exc)
 
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
