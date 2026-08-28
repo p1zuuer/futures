@@ -98,7 +98,7 @@ class RegimeTrendStrategy:
             for symbol, sides in self._last_stop_out.items()
         }
 
-    def load_cooldown_state(self, state: dict) -> None:
+    def restore_cooldown_state(self, state: dict) -> None:
         restored: Dict[str, Dict[str, pd.Timestamp]] = {}
         try:
             for symbol, sides in state.items():
@@ -109,6 +109,9 @@ class RegimeTrendStrategy:
             logger.info("Cooldown state restored | %d active cooldown(s)", len(restored))
         except (AttributeError, ValueError, TypeError) as exc:
             logger.error("Failed to restore cooldown state (%s)", exc)
+
+    def load_cooldown_state(self, state: dict) -> None:
+        return self.restore_cooldown_state(state)
 
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
