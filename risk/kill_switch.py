@@ -34,12 +34,30 @@ class KillSwitchTriggered(Exception):
 
 class KillSwitch:
     def __init__(self, config, state_store: Optional[Any] = None, notifier: Optional[Any] = None):
-        self.max_daily_loss_pct = config.KILL_MAX_DAILY_LOSS_PCT
-        self.max_consecutive_losses = config.KILL_MAX_CONSECUTIVE_LOSSES
-        self.max_position_notional_pct = config.KILL_MAX_POSITION_NOTIONAL_PCT
-        self.max_slippage_pct = config.KILL_MAX_SLIPPAGE_PCT
-        self.max_orders_per_hour = config.KILL_MAX_ORDERS_PER_HOUR
-        self.heartbeat_timeout_sec = config.KILL_HEARTBEAT_TIMEOUT_SEC
+        self.max_daily_loss_pct = getattr(config, "kill_max_daily_loss_pct", None)
+        if self.max_daily_loss_pct is None:
+            self.max_daily_loss_pct = getattr(config, "KILL_MAX_DAILY_LOSS_PCT", 2.0)
+
+        self.max_consecutive_losses = getattr(config, "kill_max_consecutive_losses", None)
+        if self.max_consecutive_losses is None:
+            self.max_consecutive_losses = getattr(config, "KILL_MAX_CONSECUTIVE_LOSSES", 3)
+
+        self.max_position_notional_pct = getattr(config, "kill_max_position_notional_pct", None)
+        if self.max_position_notional_pct is None:
+            self.max_position_notional_pct = getattr(config, "KILL_MAX_POSITION_NOTIONAL_PCT", 5.0)
+
+        self.max_slippage_pct = getattr(config, "kill_max_slippage_pct", None)
+        if self.max_slippage_pct is None:
+            self.max_slippage_pct = getattr(config, "KILL_MAX_SLIPPAGE_PCT", 0.5)
+
+        self.max_orders_per_hour = getattr(config, "kill_max_orders_per_hour", None)
+        if self.max_orders_per_hour is None:
+            self.max_orders_per_hour = getattr(config, "KILL_MAX_ORDERS_PER_HOUR", 10)
+
+        self.heartbeat_timeout_sec = getattr(config, "kill_heartbeat_timeout_sec", None)
+        if self.heartbeat_timeout_sec is None:
+            self.heartbeat_timeout_sec = getattr(config, "KILL_HEARTBEAT_TIMEOUT_SEC", 300.0)
+
         self._order_timestamps: List[float] = []
         
         self.state_store = state_store
