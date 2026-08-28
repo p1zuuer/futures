@@ -442,7 +442,7 @@ class Settings:
             # RISK_PER_TRADE (explicitly requested name) takes priority if
             # set; RISK_PER_TRADE_PCT is the original/legacy name and
             # remains supported for backward compatibility.
-            risk_per_trade_pct=_get_float("RISK_PER_TRADE", _get_float("RISK_PER_TRADE_PCT", 1.0)),
+            risk_per_trade_pct=_get_float("RISK_PER_TRADE", _get_float("RISK_PER_TRADE_PCT", 0.25)),
             kill_max_daily_loss_pct=_get_float("KILL_MAX_DAILY_LOSS_PCT", 2.0),
             kill_max_consecutive_losses=_get_int("KILL_MAX_CONSECUTIVE_LOSSES", 3),
             kill_max_position_notional_pct=_get_float("KILL_MAX_POSITION_NOTIONAL_PCT", 5.0),
@@ -583,7 +583,11 @@ class Settings:
                 f"n_donchian={self.strategy_n_donchian}/n_bb={self.strategy_n_bb}/"
                 f"comp_thresh={self.strategy_compression_percentile_threshold}"
                 if self.strategy_type == "volatility_expansion"
-                else f"confirmation_candles={self.strategy_confirmation_candles}"
+                else (
+                    f"ema_fast=20/ema_slow=100/adx_min=22.0"
+                    if self.strategy_type == "regime_trend"
+                    else f"confirmation_candles={self.strategy_confirmation_candles}"
+                )
             )
         )
         return (

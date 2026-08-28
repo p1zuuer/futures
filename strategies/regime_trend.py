@@ -147,6 +147,24 @@ class RegimeTrendStrategy:
         if missing:
             raise InvalidDataFrameError(f"DataFrame is missing required columns: {missing}")
 
+    def check_regime_invalidation(self, symbol: str, df: pd.DataFrame, position_side: str) -> bool:
+        """
+        Check if the trend regime has invalidated for an open position
+        (e.g. slow EMA slope inverted against the position direction across
+        the last 2 closed bars).
+        """
+        if len(df) < self.ema_slow + 5:
+            return False
+        indicators = self.compute_indicators(df)
+        last_two = indicators.iloc[-3:-1]
+        slopes = last_two["ema_slow_slope"]
+
+        if position_side.upper() == "LONG" and (slopes < 0).all():
+            return True
+        if position_side.upper() == "SHORT" and (slopes > 0).all():
+            return True
+        return False
+
     def analyze(self, symbol: str, df: pd.DataFrame) -> RegimeSignal:
         self._validate_columns(df)
         return self.generate_signal(df, symbol)

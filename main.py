@@ -72,6 +72,7 @@ from exchange.paper_exchange import (
     PaperExchange,
 )
 from risk.manager import PositionPlan, RiskManager
+from risk.kill_switch import KillSwitch, KillSwitchTriggered
 from services.telegram_notifier import TelegramNotifier
 from state.persistence import BotStateStore
 from strategies.trend_ema import Signal, StrategyError, TrendEmaStrategy
@@ -392,6 +393,10 @@ class TradingBot:
         self.state_store: Optional[BotStateStore] = (
             BotStateStore(settings.state_file_path) if settings.state_persistence_enabled else None
         )
+
+        self.kill_switch = KillSwitch(settings)
+        if self.kill_switch.is_active:
+            raise KillSwitchTriggered("Kill switch is active at startup.")
 
         self._running = False
         self._tick_number = 0
@@ -781,6 +786,15 @@ class TradingBot:
         post_summary = await self.exchange.get_account_summary()
         has_open_position = symbol in post_summary["open_positions"]
 
+        if has_open_position and hasattr(self.strategy, "check_regime_invalidation"):
+            pos = post_summary["open_positions"][symbol]
+            if self.strategy.check_regime_invalidation(symbol, df, pos["side"]):
+                logger.warning("🛑 Regime invalidated for open position on %s! Closing position.", symbol)
+                await self.exchange.close_position(symbol)
+                await self._cancel_stale_conditional_orders(symbol, triggered_reason="REGIME_INVALIDATION")
+                post_summary = await self.exchange.get_account_summary()
+                has_open_position = symbol in post_summary["open_positions"]
+
         # Detect a position that existed before the tick but is gone now —
         # on_market_tick only closes positions via SL/TP triggers, so this
         # unambiguously means one of those fired.
@@ -986,6 +1000,10 @@ class TradingBot:
                 self._tick_number += 1
                 try:
                     await self._tick_once()
+                except KillSwitchTriggered:
+                    logger.critical("🛑 Kill switch triggered during tick loop! Shutting down.")
+                    self._running = False
+                    raise
                 except InsufficientFundsError as exc:
                     logger.warning("Insufficient funds during tick: %s", exc)
                 except InvalidOrderError as exc:

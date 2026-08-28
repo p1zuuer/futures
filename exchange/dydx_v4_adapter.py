@@ -795,6 +795,11 @@ class DydxV4Adapter(BaseExchange):
         market_helper = self._build_market_helper(meta)
 
         reference_price = price if price is not None else await self._get_oracle_price(symbol)
+
+        from risk.kill_switch import KillSwitch
+        KillSwitch.check_position_size(symbol, quantity, reference_price)
+        KillSwitch.check_execution_slippage(reference_price, price or reference_price)
+        KillSwitch.check_order_rate()
         notional = quantity * reference_price
         if notional < self.MIN_ORDER_NOTIONAL_USD:
             raise InvalidOrderError(
