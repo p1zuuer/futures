@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 import json
 import time
+import asyncio
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -19,7 +20,7 @@ from risk.kill_switch import KillSwitch, KillSwitchTriggered
 from state.persistence import BotStateStore
 
 
-def main():
+async def amain():
     print("=" * 80)
     print("HARD-KILL-SWITCH END-TO-END INTEGRATION TEST")
     print("=" * 80)
@@ -51,7 +52,7 @@ def main():
 
     print("\nSimulating 2 consecutive losses...")
     try:
-        ks.check_consecutive_losses(fake_trades)
+        await ks.check_consecutive_losses(fake_trades)
         print("ERROR: Kill switch failed to trigger!")
     except KillSwitchTriggered as e:
         print(f"SUCCESS: KillSwitchTriggered caught [{e.check_name}]: {e.reason}")
@@ -86,6 +87,10 @@ def main():
     print("\n" + "=" * 80)
     print("ALL INTEGRATION TESTS PASSED SUCCESSFULLY.")
     print("=" * 80)
+
+
+def main():
+    asyncio.run(amain())
 
 
 if __name__ == "__main__":

@@ -187,8 +187,10 @@ class DydxV4Adapter(BaseExchange):
     # rejection behaves identically across both backends.
     MIN_ORDER_NOTIONAL_USD: float = 1.0
 
-    def __init__(self) -> None:
+    def __init__(self, kill_switch: Optional[Any] = None) -> None:
         from exchange.indexer_http import normalize_and_validate_indexer_url
+
+        self.kill_switch = kill_switch
 
         allow_non_mainnet = os.environ.get(
             "DYDX_V4_ALLOW_NON_MAINNET_INDEXER", "false"
@@ -753,6 +755,7 @@ class DydxV4Adapter(BaseExchange):
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         leverage: float = 1.0,
+        reduce_only: bool = False,
     ) -> dict:
         """
         Sign and broadcast an order transaction to the dYdX v4 chain.
@@ -769,7 +772,7 @@ class DydxV4Adapter(BaseExchange):
             InsufficientFundsError: if free collateral can't cover margin.
             ExchangeAPIError: on unrecoverable gRPC/Indexer failures.
         """
-        if not self.live_trading_enabled:
+        if not self.live_trading_enabled and not reduce_only:
             logger.warning(
                 "🛑 LIVE TRADING KILL-SWITCH ACTIVE — refusing to place order "
                 "%s %s %s qty=%.6f on %s. Set DYDX_V4_LIVE_TRADING_ENABLED=true "
@@ -796,10 +799,12 @@ class DydxV4Adapter(BaseExchange):
 
         reference_price = price if price is not None else await self._get_oracle_price(symbol)
 
-        from risk.kill_switch import KillSwitch
-        KillSwitch.check_position_size(symbol, quantity, reference_price)
-        KillSwitch.check_execution_slippage(reference_price, price or reference_price)
-        KillSwitch.check_order_rate()
+        if self.kill_switch is not None and not reduce_only:
+            notional_val = quantity * reference_price
+            account_equity = await self.get_balance() + notional_val
+            await self.kill_switch.check_position_size(notional_val, account_equity)
+            await self.kill_switch.check_execution_slippage(reference_price, price or reference_price, side_upper)
+            await self.kill_switch.check_order_rate()
         notional = quantity * reference_price
         if notional < self.MIN_ORDER_NOTIONAL_USD:
             raise InvalidOrderError(
@@ -932,14 +937,7 @@ class DydxV4Adapter(BaseExchange):
         return result
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a resting order by its client id."""
-        if not self.live_trading_enabled:
-            logger.warning(
-                "🛑 LIVE TRADING KILL-SWITCH ACTIVE — refusing to cancel order %s.",
-                order_id,
-            )
-            raise RuntimeError("Live trading kill-switch active")
-
+        """Cancel a resting order by its client id (always allowed, even if live trading is disabled)."""
         self._ensure_node_connected()
 
         from v4_proto.dydxprotocol.clob.order_pb2 import OrderId as OrderIdProto
@@ -970,17 +968,10 @@ class DydxV4Adapter(BaseExchange):
     async def close_position(self, symbol: str) -> float:
         """
         Market-close an open position for `symbol` by submitting an
-        opposite-side, reduce-only MARKET order sized to the full position.
-        Returns the position's unrealized PnL at the time of closure
-        (actual realized PnL is confirmed asynchronously via the Indexer).
+        opposite-side, reduce-only MARKET order sized to the full position
+        (always allowed, even if live trading is disabled, for emergency exits).
+        Returns the position's unrealized PnL at the time of closure.
         """
-        if not self.live_trading_enabled:
-            logger.warning(
-                "🛑 LIVE TRADING KILL-SWITCH ACTIVE — refusing to close position %s.",
-                symbol,
-            )
-            raise RuntimeError("Live trading kill-switch active")
-
         self._ensure_node_connected()
 
         summary = await self.get_account_summary()
@@ -988,6 +979,7 @@ class DydxV4Adapter(BaseExchange):
         if position is None:
             raise InvalidOrderError(f"no open position for {symbol}")
 
+        unrealized_pnl = float(position.get("unrealized_pnl", 0.0))
         close_side = "SELL" if position["side"] == "LONG" else "BUY"
         oracle_price = await self._get_oracle_price(symbol)
 
@@ -997,12 +989,14 @@ class DydxV4Adapter(BaseExchange):
             order_type="MARKET",
             quantity=position["quantity"],
             price=oracle_price,
+            reduce_only=True,
         )
 
         logger.info(
             "✅ POSITION CLOSE SUBMITTED | %s side=%s qty=%.6f ref_price=%.4f",
             symbol, position["side"], position["quantity"], oracle_price,
         )
+        return unrealized_pnl
         return position["unrealized_pnl"]
 
     # ------------------------------------------------------------------ #
