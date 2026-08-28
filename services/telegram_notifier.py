@@ -47,6 +47,7 @@ if not logger.handlers:
 StatusCallback = Callable[[], Awaitable[dict]]
 ConfigCallback = Callable[[], Awaitable[dict]]
 RiskCallback = Callable[[], Awaitable[dict]]
+KillSwitchCallback = Callable[[], Awaitable[bool]]
 
 
 class TelegramNotifier:
@@ -71,6 +72,7 @@ class TelegramNotifier:
         self._status_callback: Optional[StatusCallback] = None
         self._config_callback: Optional[ConfigCallback] = None
         self._risk_callback: Optional[RiskCallback] = None
+        self._kill_switch_callback: Optional[KillSwitchCallback] = None
 
         if self.enabled:
             self.bot = Bot(
@@ -115,16 +117,22 @@ class TelegramNotifier:
     def set_risk_callback(self, callback: RiskCallback) -> None:
         self._risk_callback = callback
 
+    def set_kill_switch_callback(self, callback: KillSwitchCallback) -> None:
+        self._kill_switch_callback = callback
+
     def _get_menu_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="🔄 Обновить", callback_data="menu_refresh"),
-                    InlineKeyboardButton(text="📊 PnL Stats", callback_data="menu_pnl"),
+                    InlineKeyboardButton(text="📊 Сводка / Status", callback_data="menu_status"),
+                    InlineKeyboardButton(text="📈 Риски / Risk", callback_data="menu_risk"),
                 ],
                 [
-                    InlineKeyboardButton(text="⚙️ Конфиг", callback_data="menu_config"),
-                    InlineKeyboardButton(text="🛡 Риски", callback_data="menu_risk"),
+                    InlineKeyboardButton(text="⚙️ Конфиг / Config", callback_data="menu_config"),
+                    InlineKeyboardButton(text="🔄 Обновить / Refresh", callback_data="menu_refresh"),
+                ],
+                [
+                    InlineKeyboardButton(text="🚨 EMERGENCY KILL-SWITCH", callback_data="menu_kill_switch"),
                 ],
             ]
         )
@@ -157,7 +165,7 @@ class TelegramNotifier:
             if not callback.message:
                 return
 
-            if data == "menu_refresh":
+            if data == "menu_refresh" or data == "menu_status":
                 text = await self._build_status_text()
             elif data == "menu_pnl":
                 text = await self._build_pnl_text()
@@ -165,6 +173,25 @@ class TelegramNotifier:
                 text = await self._build_config_text()
             elif data == "menu_risk":
                 text = await self._build_risk_text()
+            elif data == "menu_kill_switch":
+                # Step 1: Confirmation prompt
+                confirm_keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="⚠️ YES, CONFIRM KILL-SWITCH", callback_data="ks_confirm"),
+                            InlineKeyboardButton(text="❌ Abort", callback_data="ks_abort"),
+                        ]
+                    ]
+                )
+                try:
+                    await callback.message.edit_text(
+                        text="🚨 <b>EMERGENCY KILL-SWITCH</b> 🚨\n\nAre you sure you want to activate the kill-switch? This will immediately cancel all open orders and close all positions!",
+                        reply_markup=confirm_keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to edit message for kill-switch prompt: %s", exc)
+                return
             else:
                 text = await self._build_status_text()
 
@@ -176,6 +203,44 @@ class TelegramNotifier:
                 )
             except Exception as exc:
                 logger.debug("Failed to edit message on callback: %s", exc)
+
+        @self.dispatcher.callback_query(F.data.in_({"ks_confirm", "ks_abort"}))
+        async def _on_kill_switch_action(callback: CallbackQuery) -> None:
+            data = callback.data
+            await callback.answer()
+            if not callback.message:
+                return
+
+            if data == "ks_abort":
+                text = await self._build_status_text()
+                try:
+                    await callback.message.edit_text(
+                        text="✅ Kill-switch aborted. Bot continues normal operation.\n\n" + text,
+                        reply_markup=self._get_menu_keyboard(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to edit message on ks_abort: %s", exc)
+                return
+
+            if data == "ks_confirm":
+                triggered = False
+                if self._kill_switch_callback is not None:
+                    try:
+                        triggered = await self._kill_switch_callback()
+                    except Exception as exc:
+                        logger.exception("Kill switch callback failed: %s", exc)
+
+                status_note = "🛑 <b>KILL-SWITCH TRIGGERED CONFIRMED!</b> All orders cancelled and positions closed." if triggered else "⚠️ Kill-switch triggered, but callback returned false or was unhandled."
+                try:
+                    await callback.message.edit_text(
+                        text=f"{status_note}\n\n━━━━━━━━━━━━\nSend /status or /menu to refresh.",
+                        reply_markup=self._get_menu_keyboard(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to edit message on ks_confirm: %s", exc)
+                return
 
         @self.dispatcher.message(F.text)
         async def _on_unknown(message: Message) -> None:
@@ -257,22 +322,27 @@ class TelegramNotifier:
                 symbols = cfg.get("symbols", [])
                 strat = cfg.get("strategy", "trend_pullback")
                 res = cfg.get("candle_resolution", "5m")
+                mode_emoji = "🟢" if mode == "PAPER" else "⚡"
                 return (
-                    "⚙️ <b>BOT CONFIGURATION</b>\n\n"
-                    f"🟢/🔴 Mode: <b>{mode}</b>\n"
-                    f"🏷 Symbols: <b>{', '.join(symbols)}</b>\n"
-                    f"📈 Strategy: <b>{strat}</b>\n"
-                    f"⏱ Resolution: <b>{res}</b>"
+                    "⚙️ <b>BOT CONFIGURATION</b>\n"
+                    "━━━━━━━━━━━━\n"
+                    f"• Mode: <code>{mode}</code> {mode_emoji}\n"
+                    f"• Symbols: <code>{', '.join(symbols)}</code>\n"
+                    f"• Strategy: <code>{strat}</code>\n"
+                    f"• Resolution: <code>{res}</code>\n"
+                    "━━━━━━━━━━━━"
                 )
             except Exception:
                 pass
 
         return (
-            "⚙️ <b>BOT CONFIGURATION</b>\n\n"
-            "🟢/🔴 Mode: <b>PAPER</b> (default)\n"
-            "🏷 Symbols: <b>ETH-USD</b>\n"
-            "📈 Strategy: <b>trend_pullback</b>\n"
-            "⏱ Resolution: <b>5m</b>"
+            "⚙️ <b>BOT CONFIGURATION</b>\n"
+            "━━━━━━━━━━━━\n"
+            "• Mode: <code>PAPER</code> 🟢\n"
+            "• Symbols: <code>ETH-USD</code>\n"
+            "• Strategy: <code>trend_pullback</code>\n"
+            "• Resolution: <code>5m</code>\n"
+            "━━━━━━━━━━━━"
         )
 
     async def _build_risk_text(self) -> str:
@@ -282,23 +352,27 @@ class TelegramNotifier:
                 dd = r.get("daily_drawdown_pct", 0.0)
                 max_dd = r.get("max_daily_loss_pct", 5.0)
                 ks = r.get("kill_switch_active", False)
-                ks_emoji = "🛑 ACTIVE" if ks else "✅ Normal"
+                ks_status = "ACTIVE 🔴" if ks else "NORMAL 🟢"
                 return (
-                    "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n\n"
-                    f"📉 Daily Drawdown: <b>{dd:.2f}%</b> (Max: {max_dd:.1f}%)\n"
-                    f"🚨 Kill-Switch: <b>{ks_emoji}</b>\n"
-                    f"⚖️ Risk per Trade: <b>1.0%</b>\n"
-                    f"📐 Max Leverage: <b>5x</b>"
+                    "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n"
+                    "━━━━━━━━━━━━\n"
+                    f"• Daily Drawdown: <code>{dd:.2f}%</code> (Max: <code>{max_dd:.1f}%</code>)\n"
+                    f"• Kill-Switch: <code>{ks_status}</code>\n"
+                    f"• Risk per Trade: <code>1.0%</code>\n"
+                    f"• Max Leverage: <code>5x</code>\n"
+                    "━━━━━━━━━━━━"
                 )
             except Exception:
                 pass
 
         return (
-            "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n\n"
-            "📉 Daily Drawdown: <b>0.00%</b> (Max: 5.0%)\n"
-            "🚨 Kill-Switch: <b>✅ Normal</b>\n"
-            "⚖️ Risk per Trade: <b>1.0%</b>\n"
-            "📐 Max Leverage: <b>5x</b>"
+            "🛡 <b>RISK MANAGEMENT & LIMITS</b>\n"
+            "━━━━━━━━━━━━\n"
+            "• Daily Drawdown: <code>0.00%</code> (Max: <code>5.0%</code>)\n"
+            "• Kill-Switch: <code>NORMAL 🟢</code>\n"
+            "• Risk per Trade: <code>1.0%</code>\n"
+            "• Max Leverage: <code>5x</code>\n"
+            "━━━━━━━━━━━━"
         )
 
     async def _build_status_text(self) -> str:
@@ -320,12 +394,12 @@ class TelegramNotifier:
 
         lines = [
             "📊 <b>ACCOUNT STATUS</b>",
-            "",
-            f"💰 Balance: <b>${balance:.4f}</b>",
-            f"📈 Equity: <b>${equity:.4f}</b>",
-            f"🆓 Free Margin: <b>${free_margin:.4f}</b>",
-            f"📐 Margin Usage: <b>{margin_usage:.2f}%</b>",
-            "",
+            "━━━━━━━━━━━━",
+            f"• Balance:      <code>${balance:.4f}</code>",
+            f"• Equity:       <code>${equity:.4f}</code>",
+            f"• Free Margin:  <code>${free_margin:.4f}</code>",
+            f"• Margin Usage: <code>{margin_usage:.2f}%</code>",
+            "━━━━━━━━━━━━",
         ]
 
         if positions:
@@ -337,23 +411,22 @@ class TelegramNotifier:
                 upnl = pos.get("unrealized_pnl", 0.0)
                 pnl_emoji = "🟢" if upnl >= 0 else "🔴"
                 lines.append(
-                    f"  • {symbol} {side} qty={qty:.6f} entry=${entry:.4f} "
-                    f"{pnl_emoji} uPnL=${upnl:.4f}"
+                    f"  • <code>{symbol}</code> {side} qty=<code>{qty:.6f}</code> entry=<code>${entry:.4f}</code> {pnl_emoji} uPnL=<code>${upnl:.4f}</code>"
                 )
         else:
-            lines.append("<b>Open Positions:</b> none")
+            lines.append("<b>Open Positions:</b> <code>none</code>")
 
-        lines.append("")
+        lines.append("━━━━━━━━━━━━")
         if pending:
             lines.append(f"<b>Pending Orders ({len(pending)}):</b>")
             for order_id, order in pending.items():
                 lines.append(
-                    f"  • {order_id[:14]}… {order.get('side', '?')} "
-                    f"{order.get('symbol', '?')} @ {order.get('price', 0.0)}"
+                    f"  • <code>{order_id[:14]}…</code> {order.get('side', '?')} <code>{order.get('symbol', '?')}</code> @ <code>{order.get('price', 0.0)}</code>"
                 )
         else:
-            lines.append("<b>Pending Orders:</b> none")
+            lines.append("<b>Pending Orders:</b> <code>none</code>")
 
+        lines.append("━━━━━━━━━━━━")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ #

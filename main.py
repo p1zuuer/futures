@@ -289,6 +289,21 @@ class TradingBot:
         # now 5-minute candles, configurable via CANDLE_RESOLUTION.
         self.candle_resolution: str = settings.candle_resolution
 
+        self.notifier = TelegramNotifier.from_env()
+
+        # Restart-safety persistence (see state/persistence.py). Disabled
+        # entirely via STATE_PERSISTENCE_ENABLED=false if not wanted.
+        self.state_store: Optional[BotStateStore] = (
+            BotStateStore(settings.state_file_path) if settings.state_persistence_enabled else None
+        )
+
+        self.kill_switch = KillSwitch(settings, state_store=self.state_store, notifier=self.notifier)
+        if self.kill_switch.is_active:
+            raise KillSwitchTriggered(
+                reason=self.kill_switch.reason or "Kill switch is active at startup.",
+                check_name=self.kill_switch.check_name or "STARTUP_BLOCK",
+            )
+
         # A SINGLE shared exchange adapter instance is used across every
         # symbol — this is what makes sequential per-symbol processing
         # actually respect account-wide rate limits (one Indexer
@@ -297,7 +312,7 @@ class TradingBot:
         # symbols in a single get_account_summary() call).
         self.exchange: BaseExchange
         if self.live_trading_enabled:
-            self.exchange = DydxV4Adapter()
+            self.exchange = DydxV4Adapter(kill_switch=self.kill_switch)
             logger.info("TradingBot initialized in LIVE dYdX v4 mode")
         else:
             self.exchange = PaperExchange(initial_balance=initial_balance)
@@ -394,9 +409,12 @@ class TradingBot:
             BotStateStore(settings.state_file_path) if settings.state_persistence_enabled else None
         )
 
-        self.kill_switch = KillSwitch(settings)
+        self.kill_switch = KillSwitch(settings, state_store=self.state_store, notifier=self.notifier)
         if self.kill_switch.is_active:
-            raise KillSwitchTriggered("Kill switch is active at startup.")
+            raise KillSwitchTriggered(
+                reason=self.kill_switch.reason or "Kill switch is active at startup.",
+                check_name=self.kill_switch.check_name or "STARTUP_BLOCK",
+            )
 
         self._running = False
         self._tick_number = 0
@@ -462,7 +480,13 @@ class TradingBot:
         if not self._background_tasks:
             return
         try:
-            await asyncio.wait(self._background_tasks, timeout=timeout)
+            done, pending = await asyncio.wait(self._background_tasks, timeout=timeout)
+            if pending:
+                logger.warning("Cancelling %d stuck background task(s) on shutdown timeout", len(pending))
+                for task in pending:
+                    task.cancel()
+                # Даем секунду на корректное завершение отмененных задач
+                await asyncio.gather(*pending, return_exceptions=True)
         except Exception as exc:  # noqa: BLE001 - never block shutdown on this
             logger.warning("Error while draining background tasks: %s", exc)
 
@@ -483,43 +507,45 @@ class TradingBot:
 
     async def _cancel_stale_conditional_orders(self, symbol: str, triggered_reason: str) -> None:
         """
-        Cancel whichever conditional order (SL or TP) did NOT trigger,
-        after the other one closed the position. dYdX v4 does not link
-        these as an OCO pair — they're two independent orders submitted
-        separately by `place_order()` — so the one that didn't fire keeps
-        resting on the book indefinitely unless explicitly cancelled here.
-        Left alone, it can later trigger against a completely unrelated
-        future position at a stale price. No-op for PaperExchange (which
-        has no conditional-order concept; nothing gets recorded into
-        `_open_conditional_orders` for it in the first place).
+        Cancel conditional orders after a position closes. For standard SL/TP
+        triggers, the opposite leg is cancelled as a stale order. For forced
+        exits (e.g. REGIME_INVALIDATION, MAX_HOLD), both legs (SL and TP)
+        are cancelled to ensure no orphaned orders are left resting on dYdX v4.
         """
         ids = self._open_conditional_orders.pop(symbol, None)
         if not ids:
-            return
-
-        stale_id = ids["take_profit_order_id"] if triggered_reason == "STOP_LOSS" else ids["stop_loss_order_id"]
-        if not stale_id:
             return
 
         cancel_method = getattr(self.exchange, "cancel_order", None)
         if not callable(cancel_method):
             return
 
-        try:
-            await cancel_method(stale_id)
-            logger.info(
-                "🧹 Cancelled stale %s conditional order %s for %s (position closed via %s)",
-                "TAKE_PROFIT" if triggered_reason == "STOP_LOSS" else "STOP_LOSS",
-                stale_id, symbol, triggered_reason,
-            )
-        except Exception as exc:  # noqa: BLE001 - the order may have already
-            # been filled/cancelled/expired on-chain; that's fine, the goal
-            # (no stale order left resting) is already satisfied either way.
-            logger.warning(
-                "Could not cancel stale conditional order %s for %s (may already be "
-                "gone, which is fine): %s",
-                stale_id, symbol, exc,
-            )
+        stale_ids = []
+        if triggered_reason == "STOP_LOSS":
+            if ids.get("take_profit_order_id"):
+                stale_ids.append(ids["take_profit_order_id"])
+        elif triggered_reason == "TAKE_PROFIT":
+            if ids.get("stop_loss_order_id"):
+                stale_ids.append(ids["stop_loss_order_id"])
+        else:
+            # Forced exit (REGIME_INVALIDATION, MAX_HOLD, etc.) — cancel BOTH legs
+            if ids.get("stop_loss_order_id"):
+                stale_ids.append(ids["stop_loss_order_id"])
+            if ids.get("take_profit_order_id"):
+                stale_ids.append(ids["take_profit_order_id"])
+
+        for stale_id in stale_ids:
+            try:
+                await cancel_method(stale_id)
+                logger.info(
+                    "🧹 Cancelled stale conditional order %s for %s (position closed via %s)",
+                    stale_id, symbol, triggered_reason,
+                )
+            except Exception as exc:  # noqa: BLE001 - may already be gone
+                logger.warning(
+                    "Could not cancel conditional order %s for %s (may already be gone): %s",
+                    stale_id, symbol, exc,
+                )
 
     async def _notify_order_executed(
         self,
@@ -786,6 +812,10 @@ class TradingBot:
         post_summary = await self.exchange.get_account_summary()
         has_open_position = symbol in post_summary["open_positions"]
 
+        if self.kill_switch is not None:
+            day_start_eq = self.risk_manager._daily_starting_equity or post_summary["equity_usd"]
+            await self.kill_switch.check_daily_loss(post_summary["equity_usd"], day_start_eq)
+
         if has_open_position and hasattr(self.strategy, "check_regime_invalidation"):
             pos = post_summary["open_positions"][symbol]
             if self.strategy.check_regime_invalidation(symbol, df, pos["side"]):
@@ -816,6 +846,11 @@ class TradingBot:
                 self.strategy.record_stop_out(symbol, side, pd.Timestamp.now(tz="UTC"))
             self.risk_manager.record_realized_pnl(realized_pnl_usd, post_summary["balance_usd"])
 
+            if self.kill_switch is not None:
+                # Build mock trade history item for consecutive losses check
+                trade_history = [{"return_pct": (realized_pnl_usd / (entry_price * pre_position["quantity"])) * 100.0}]
+                await self.kill_switch.check_consecutive_losses(trade_history)
+
             # LIVE-mode safety: the OTHER conditional order (whichever of
             # SL/TP did NOT fire) is still resting on dYdX and will NOT be
             # auto-cancelled by the exchange. Left alone, it can later
@@ -833,6 +868,8 @@ class TradingBot:
 
         # Evaluate strategy + place sized order only when flat.
         if not has_open_position:
+            if self.kill_switch is not None:
+                await self.kill_switch.check_daily_loss(post_summary["equity_usd"], post_summary["balance_usd"])
             await self._maybe_open_position(symbol, df)
 
         return current_price
@@ -990,39 +1027,84 @@ class TradingBot:
             return self.risk_manager.get_daily_stats()
         self.notifier.set_risk_callback(_get_risk_summary)
 
+        async def _telegram_kill_switch_callback() -> bool:
+            logger.critical("🚨 EMERGENCY KILL-SWITCH ACTIVATED VIA TELEGRAM INLINE BUTTON!")
+            if self.kill_switch is not None:
+                self.kill_switch.trigger("TELEGRAM_CALLBACK_MANUAL", check_name="TELEGRAM_BUTTON")
+            self._running = False
+            return True
+        self.notifier.set_kill_switch_callback(_telegram_kill_switch_callback)
+
         logger.info(
             "TradingBot starting | symbols=%s poll_interval=%.1fs",
             list(self.symbols), poll_interval_seconds,
         )
 
         try:
-            while self._running:
-                self._tick_number += 1
-                try:
-                    await self._tick_once()
-                except KillSwitchTriggered:
-                    logger.critical("🛑 Kill switch triggered during tick loop! Shutting down.")
-                    self._running = False
-                    raise
-                except InsufficientFundsError as exc:
-                    logger.warning("Insufficient funds during tick: %s", exc)
-                except InvalidOrderError as exc:
-                    logger.warning("Invalid order during tick: %s", exc)
-                except Exception as exc:  # noqa: BLE001 - keep the loop alive
-                    logger.exception("Unexpected error during tick: %s", exc)
+            try:
+                while self._running:
+                    self._tick_number += 1
+                    try:
+                        await self._tick_once()
+                    except KillSwitchTriggered:
+                        logger.critical("🛑 Kill switch triggered during tick loop! Shutting down.")
+                        self._running = False
+                        raise
+                    except InsufficientFundsError as exc:
+                        logger.warning("Insufficient funds during tick: %s", exc)
+                    except InvalidOrderError as exc:
+                        logger.warning("Invalid order during tick: %s", exc)
+                    except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                        logger.exception("Unexpected error during tick: %s", exc)
 
-                await asyncio.sleep(poll_interval_seconds)
-        except asyncio.CancelledError:
-            logger.info("Trading loop cancelled.")
-            raise
+                    await asyncio.sleep(poll_interval_seconds)
+            except asyncio.CancelledError:
+                logger.info("Trading loop cancelled.")
+                raise
         finally:
-            self._running = False
+            await self.shutdown()
 
     async def shutdown(self) -> None:
         """Gracefully stop the loop, persist final state, close the
         Telegram session and exchange connection, and print final trade
         metrics."""
         self._running = False
+
+        # Экстренный клиринг при срабатывании KillSwitch
+        if self.kill_switch is not None and getattr(self.kill_switch, "is_active", False):
+            logger.critical("🚨 EMERGENCY KILL-SWITCH CLEARING: Cancelling orders and closing open positions...")
+            
+            # 1. Отменяем все ордера / условные ордера (отдельный try/except блок)
+            try:
+                cancel_all = getattr(self.exchange, "cancel_all_open_orders", None)
+                if callable(cancel_all):
+                    await cancel_all()
+                else:
+                    for sym, ids in list(self._open_conditional_orders.items()):
+                        for order_key in ("stop_loss_order_id", "take_profit_order_id"):
+                            oid = ids.get(order_key)
+                            if oid:
+                                cancel_method = getattr(self.exchange, "cancel_order", None)
+                                if callable(cancel_method):
+                                    try:
+                                        await cancel_method(oid)
+                                    except Exception:
+                                        pass
+                    self._open_conditional_orders.clear()
+            except Exception as exc:
+                logger.exception("Failed to cancel orders during emergency kill-switch clearing: %s", exc)
+
+            # 2. Закрываем все открытые позиции (отдельный try/except блок)
+            try:
+                summary = await self.exchange.get_account_summary()
+                open_positions = summary.get("open_positions", {})
+                for sym in list(open_positions.keys()):
+                    logger.warning("🚨 EMERGENCY CLOSE POSITION for %s", sym)
+                    close_pos_method = getattr(self.exchange, "close_position", None)
+                    if callable(close_pos_method):
+                        await close_pos_method(sym)
+            except Exception as exc:
+                logger.exception("Failed to close positions during emergency kill-switch clearing: %s", exc)
 
         # Give any in-flight fire-and-forget Telegram alerts (e.g. a final
         # position-closed notification) a bounded chance to finish before
@@ -1041,13 +1123,15 @@ class TradingBot:
         # (DydxV4Adapter closes its gRPC channel; PaperExchange has no
         # connection to close and simply won't define this method).
         close_method = getattr(self.exchange, "close", None)
+        
+        # Получаем сводку ДО закрытия соединения close_method()
+        summary = await self.exchange.get_account_summary()
+
         if callable(close_method):
             try:
                 await close_method()
             except Exception as exc:  # noqa: BLE001 - never block shutdown
                 logger.warning("Error while closing exchange connection: %s", exc)
-
-        summary = await self.exchange.get_account_summary()
 
         print("\n" + "=" * 60)
         print("TRADING BOT SHUTDOWN — FINAL ACCOUNT SUMMARY")
