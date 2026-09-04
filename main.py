@@ -283,7 +283,8 @@ class TradingBot:
         # this flag is not the only guard against accidental live trading.
         self.live_trading_enabled: bool = settings.dydx_v4_live_trading_enabled
 
-        # Candle resolution for both live/paper market data and strategy
+        # In-memory store for latest symbol ADX / indicator metrics for pulse visibility
+        self._symbol_metrics: Dict[str, dict] = {}
         # evaluation. 1-minute EMA crossovers proved too noisy/fee-heavy
         # in backtesting (see scripts/calibrate_strategy.py); default is
         # now 5-minute candles, configurable via CANDLE_RESOLUTION.
@@ -715,14 +716,19 @@ class TradingBot:
         for symbol in self.symbols:
             price = tick_prices.get(symbol)
             price_str = f"${price:.2f}" if price is not None else "N/A"
+            
+            metrics = self._symbol_metrics.get(symbol, {})
+            adx_val = metrics.get("adx")
+            adx_str = f" ADX={adx_val:.1f}" if adx_val is not None else ""
+
             if symbol in positions:
                 pos = positions[symbol]
                 per_symbol_desc.append(
                     f"{symbol}={price_str}[{pos['side']} qty={pos['quantity']:.6f} "
-                    f"uPnL=${pos['unrealized_pnl']:.4f}]"
+                    f"uPnL=${pos['unrealized_pnl']:.4f}{adx_str}]"
                 )
             else:
-                per_symbol_desc.append(f"{symbol}={price_str}[flat]")
+                per_symbol_desc.append(f"{symbol}={price_str}[flat{adx_str}]")
 
         daily_stats = self.risk_manager.get_daily_stats()
         risk_desc = (
@@ -795,6 +801,18 @@ class TradingBot:
         if market_data is None:
             return None
         current_price, df = market_data
+
+        # Calculate indicators and store latest ADX/regime status for pulse visibility
+        try:
+            ind_func = getattr(self.strategy, "calculate_indicators", None) or getattr(self.strategy, "compute_indicators", None)
+            if callable(ind_func):
+                ind_df = ind_func(df)
+                if not ind_df.empty:
+                    last_row = ind_df.iloc[-2] if len(ind_df) > 1 else ind_df.iloc[-1]
+                    adx_val = float(last_row["adx"]) if "adx" in last_row and not pd.isna(last_row["adx"]) else 0.0
+                    self._symbol_metrics[symbol] = {"adx": adx_val}
+        except Exception:
+            pass
 
         # Snapshot position + balance state before the tick so we can
         # detect an SL/TP-triggered close performed internally by
@@ -1030,7 +1048,10 @@ class TradingBot:
         async def _telegram_kill_switch_callback() -> bool:
             logger.critical("🚨 EMERGENCY KILL-SWITCH ACTIVATED VIA TELEGRAM INLINE BUTTON!")
             if self.kill_switch is not None:
-                self.kill_switch.trigger("TELEGRAM_CALLBACK_MANUAL", check_name="TELEGRAM_BUTTON")
+                try:
+                    await self.kill_switch.trigger("TELEGRAM_CALLBACK_MANUAL", check_name="TELEGRAM_BUTTON")
+                except KillSwitchTriggered:
+                    pass
             self._running = False
             return True
         self.notifier.set_kill_switch_callback(_telegram_kill_switch_callback)

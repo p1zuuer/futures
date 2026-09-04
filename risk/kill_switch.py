@@ -93,6 +93,9 @@ class KillSwitch:
                 logger.error("Failed to persist kill switch state: %s", exc)
 
     async def _trigger(self, reason: str, check_name: str) -> None:
+        await self.trigger(reason=reason, check_name=check_name)
+
+    async def trigger(self, reason: str, check_name: str) -> None:
         self.is_active = True
         self.reason = reason
         self.check_name = check_name
